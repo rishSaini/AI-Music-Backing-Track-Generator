@@ -1,0 +1,56 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# ===== Virtual environments =====
+.venv/
+venv/
+env/
+ENV/
+.ENV/
+
+# ===== Packaging / builds =====
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ===== Test / coverage =====
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# ===== Logs =====
+*.log
+
+# ===== OS files =====
+.DS_Store
+Thumbs.db
+
+# ===== Jupyter / notebooks =====
+.ipynb_checkpoints/
+
+# ===== IDEs/editors =====
+.vscode/
+.idea/
+*.swp
+
+# ===== Project-specific =====
+# Generated outputs (keep raw inputs if you want)
+data/generated/
+*.mid~
+*.midi~
+*.wav
+
+# If you never want to commit raw MIDIs either, uncomment:
+# data/raw/
