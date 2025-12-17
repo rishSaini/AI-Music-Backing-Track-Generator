@@ -14,6 +14,7 @@ from .moods import apply_mood_to_key, get_mood, list_moods
 from .harmony_baseline import generate_chords
 from .arrange import arrange_backing
 from .render import RenderConfig, write_midi
+from .humanize import HumanizeConfig, humanize_arrangement
 
 
 app = typer.Typer(add_completion=False, help="AI MIDI backing-track generator (v1 baseline).")
@@ -30,6 +31,11 @@ def generate(
     no_drums: bool = typer.Option(False, "--no-drums", help="Disable drum track generation"),
     no_bass: bool = typer.Option(False, "--no-bass", help="Disable bass track generation"),
     no_pad: bool = typer.Option(False, "--no-pad", help="Disable pad track generation"),
+    humanize: bool = typer.Option(True, "--humanize/--no-humanize", help="Apply humanization (timing/velocity/swing)"),
+    jitter_ms: float = typer.Option(15.0, "--jitter-ms", help="Timing jitter amount in milliseconds"),
+    vel_jitter: int = typer.Option(8, "--vel-jitter", help="Velocity jitter amount"),
+    swing: float = typer.Option(0.15, "--swing", help="Swing amount 0..1 (offbeat delay)"),
+    seed: Optional[int] = typer.Option(None, "--seed", help="Random seed for deterministic humanization"),
 ):
     """
     Generate a backing track (bass/pad/drums) for a MIDI melody.
@@ -79,6 +85,14 @@ def generate(
         make_pad=not no_pad,
         make_drums=not no_drums,
     )
+
+    if humanize:
+        arrangement = humanize_arrangement(
+            arrangement,
+            grid,
+            HumanizeConfig(timing_jitter_ms=jitter_ms, velocity_jitter=vel_jitter, swing=swing, seed=seed),
+        )
+
 
     counts = {k: len(v) for k, v in arrangement.tracks.items()}
     typer.echo(f"Backing note counts: {counts}")

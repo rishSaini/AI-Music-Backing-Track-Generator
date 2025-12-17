@@ -14,6 +14,7 @@ from backingtrack.moods import get_mood, list_moods, apply_mood_to_key
 from backingtrack.harmony_baseline import generate_chords
 from backingtrack.arrange import arrange_backing
 from backingtrack.render import write_midi
+from backingtrack.humanize import HumanizeConfig, humanize_arrangement
 
 PC_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
@@ -82,6 +83,15 @@ with left:
     quantize_melody = st.toggle("Quantize melody to beat grid", value=False)
 
     st.divider()
+    st.markdown("**Humanize**")
+    humanize = st.toggle("Humanize timing/velocity", value=True)
+    jitter_ms = st.slider("Timing jitter (ms)", 0.0, 35.0, 15.0, 1.0)
+    vel_jitter = st.slider("Velocity jitter", 0, 20, 8, 1)
+    swing = st.slider("Swing (0..1)", 0.0, 0.6, 0.15, 0.01)
+    seed = st.number_input("Seed (optional)", value=0, step=1)
+    use_seed = st.toggle("Use seed", value=False)
+
+    st.divider()
     st.markdown("**Backing tracks**")
     make_bass = st.toggle("Bass", value=True)
     make_pad = st.toggle("Pad", value=True)
@@ -133,6 +143,20 @@ def run_pipeline(midi_bytes: bytes, mood_name: str, bars_per_chord: int, quantiz
         make_pad=make_pad,
         make_drums=make_drums,
     )
+
+
+    if humanize:
+        arrangement = humanize_arrangement(
+            arrangement,
+            grid,
+            HumanizeConfig(
+                timing_jitter_ms=jitter_ms,
+                velocity_jitter=vel_jitter,
+                swing=swing,
+                seed=int(seed) if use_seed else None,
+            ),
+        )
+
 
     out_path = Path(tempfile.mkstemp(suffix=".mid")[1])
     write_midi(out_path, melody_notes, arrangement, info)

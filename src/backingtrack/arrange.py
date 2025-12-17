@@ -136,30 +136,37 @@ def _make_pad(
     pad_octave: int,
 ) -> List[Note]:
     """
-    Sustained block-chord pad.
-    We pick a voicing near a target register, influenced by mood.brightness.
+    Sustained block-chord pad with basic voice-leading:
+    choose inversions/voicings that minimize movement from previous chord.
     """
     out: List[Note] = []
 
-    # Brightness shifts pad register up/down a bit
-    # brightness in [-1,1] => shift by up to ~1 octave
-    shift = int(round(float(mood.brightness) * 8))  # semitone-ish shift
-    target = 12 * pad_octave + 12 + shift  # around C5-ish if pad_octave=4
+    shift = int(round(float(mood.brightness) * 8))
+    target = 12 * pad_octave + 12 + shift  # around C5-ish
 
-    # Simpler = fewer notes, busier moods allow a bit more color
     max_notes = 3 if mood.rhythm_density < 0.55 else 4
 
+    prev_voicing: Optional[List[int]] = None
+
     for ch in chords:
-        pcs_ordered = _ordered_chord_pcs(ch)
-        pitches = _voicing_from_pcs(pcs_ordered, around=target, max_notes=max_notes)
+        pcs = _ordered_chord_pcs(ch)[:max_notes]
 
-        vel = 62 if mood.rhythm_density < 0.55 else 70
+        candidates = _voicing_candidates(pcs, around=target, lo=48, hi=92)
+        if not candidates:
+            continue
 
-        # Sustain for the chord duration (slightly shortened to avoid overlaps)
+        if prev_voicing is None:
+            voicing = candidates[0]
+        else:
+            voicing = min(candidates, key=lambda v: _voicing_cost(v, prev_voicing))
+
+        prev_voicing = voicing
+
+        vel = 60 if mood.rhythm_density < 0.55 else 68
         start = ch.start
-        end = max(start + 0.05, ch.end - 0.01)
+        end = max(start + 0.08, ch.end - 0.01)
 
-        for p in pitches:
+        for p in voicing:
             out.append(Note(pitch=p, start=start, end=end, velocity=vel))
 
     return out
@@ -309,3 +316,84 @@ def _make_drums(
                     out.append(Note(pitch=OPEN_HH, start=max(ch.start, t0), end=min(ch.end, t1), velocity=80))
 
     return out
+
+def _voicing_candidates(pcs: Sequence[int], *, around: int, lo: int, hi: int) -> List[List[int]]:
+    """
+    Generate a few inversion-like voicings near 'around'.
+    """
+    pcs = list(pcs)
+    if not pcs:
+        return []
+
+    candidates: List[List[int]] = []
+    n = len(pcs)
+
+    for inv in range(n):
+        rot = pcs[inv:] + pcs[:inv]
+
+        # Build ascending pitches
+        p0 = _nearest_midi_for_pc(rot[0], around=around, lo=lo, hi=hi)
+        pitches = [p0]
+
+        for pc in rot[1:]:
+            p = _nearest_midi_for_pc(pc, around=pitches[-1] + 7, lo=lo, hi=hi)
+            while p <= pitches[-1] + 2:
+                p += 12
+            pitches.append(p)
+
+        # If overall center is far from target, shift by octaves
+        center = sum(pitches) / len(pitches)
+        while center < around - 6 and max(pitches) + 12 <= hi:
+            pitches = [p + 12 for p in pitches]
+            center = sum(pitches) / len(pitches)
+        while center > around + 6 and min(pitches) - 12 >= lo:
+            pitches = [p - 12 for p in pitches]
+            center = sum(pitches) / len(pitches)
+
+        # Clamp and ensure sorted
+        pitches = [max(lo, min(hi, p)) for p in pitches]
+        pitches.sort()
+
+        # Remove duplicates by pushing up octaves if needed
+        fixed: List[int] = []
+        for p in pitches:
+            if not fixed:
+                fixed.append(p)
+                continue
+            while p <= fixed[-1]:
+                p += 12
+            if p <= hi:
+                fixed.append(p)
+
+        if len(fixed) >= 3:
+            candidates.append(fixed)
+
+    # Dedup by tuple representation
+    uniq: List[List[int]] = []
+    seen = set()
+    for c in candidates:
+        t = tuple(c)
+        if t not in seen:
+            seen.add(t)
+            uniq.append(c)
+    return uniq
+
+
+def _voicing_cost(curr: Sequence[int], prev: Sequence[int]) -> float:
+    """
+    Smaller cost = smoother movement.
+    """
+    m = min(len(curr), len(prev))
+    cost = sum(abs(curr[i] - prev[i]) for i in range(m))
+
+    # Penalize big jumps in chord "center"
+    c_center = sum(curr) / len(curr)
+    p_center = sum(prev) / len(prev)
+    cost += 0.35 * abs(c_center - p_center)
+
+    # Penalize extreme spread (too wide sounds thin, too tight can clash)
+    spread = max(curr) - min(curr)
+    if spread > 19:  # > ~a 10th
+        cost += (spread - 19) * 0.25
+
+    return cost
