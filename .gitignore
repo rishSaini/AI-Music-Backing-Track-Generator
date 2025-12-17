@@ -52,5 +52,4 @@ data/generated/
 *.midi~
 *.wav
 
-# If you never want to commit raw MIDIs either, uncomment:
-# data/raw/
+data/raw/
