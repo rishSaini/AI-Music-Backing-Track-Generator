@@ -9,10 +9,10 @@ from backingtrack.render import write_midi
 pm, info, grid, melody_inst, sel = load_and_prepare("data/raw/Tokyo Ghoul - Unravel.mid")
 mel = extract_melody_notes(melody_inst, grid=grid)
 
-mood = get_mood("happy")
+mood = get_mood("sad")
 key = apply_mood_to_key(estimate_key(mel), mood)
 
 chords = generate_chords(key, grid, duration_seconds=info.duration, mood=mood, melody_notes=mel)
 arr = arrange_backing(chords, grid, mood)
 
-write_midi("data/generated/out.mid", mel, arr, info)
+write_midi("data/generated/unravelsad.mid", mel, arr, info)
