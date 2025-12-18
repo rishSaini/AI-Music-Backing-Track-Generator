@@ -51,6 +51,7 @@ data/generated/
 *.mid~
 *.midi~
 *.wav
+*.npz
 
 data/raw/
 data/datasets/
