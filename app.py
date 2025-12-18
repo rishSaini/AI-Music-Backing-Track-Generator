@@ -91,6 +91,8 @@ with left:
     seed = st.number_input("Seed (optional)", value=0, step=1)
     use_seed = st.toggle("Use seed", value=False)
 
+    structure_mode = "auto" if st.toggle("Auto song sections (intro/verse/chorus/outro)", value=True) else "none"
+
     st.divider()
     st.markdown("**Backing tracks**")
     make_bass = st.toggle("Bass", value=True)
@@ -142,8 +144,9 @@ def run_pipeline(midi_bytes: bytes, mood_name: str, bars_per_chord: int, quantiz
         make_bass=make_bass,
         make_pad=make_pad,
         make_drums=make_drums,
+        structure_mode=structure_mode, 
+        seed=seed
     )
-
 
     if humanize:
         arrangement = humanize_arrangement(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 import random
 
+from .structure import SongStructure, auto_structure
 from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
@@ -32,6 +33,7 @@ CRASH = 49
 LOW_TOM = 45
 MID_TOM = 47
 HIGH_TOM = 50
+RIDE = 51
 
 def arrange_backing(
     chords: Sequence[ChordEvent],
@@ -43,24 +45,33 @@ def arrange_backing(
     make_drums: bool = True,
     bass_octave: int = 2,
     pad_octave: int = 4,
-    seed: int | None = None,
+    seed: Optional[int] = None,
+    structure_mode: str = "none",   # "none" or "auto"
 ) -> Arrangement:
-    """
-    Generate backing tracks from chords + mood.
-    seed makes groove variation deterministic.
-    """
     rng = random.Random(seed)
+
+    # total bars from chords
+    total_end = max((c.end for c in chords), default=0.0)
+    num_bars = grid.bar_index_at(max(grid.start_time, total_end - 1e-6)) + 1
+
+    structure: Optional[SongStructure] = None
+    if structure_mode == "auto":
+        structure = auto_structure(
+            num_bars=num_bars,
+            base_density=float(mood.rhythm_density),
+            base_brightness=float(mood.brightness),
+        )
 
     tracks: Dict[TrackName, List[Note]] = {"bass": [], "pad": [], "drums": []}
 
     if make_bass:
-        tracks["bass"] = _make_bass(chords, grid, mood, bass_octave=bass_octave, rng=rng)
+        tracks["bass"] = _make_bass(chords, grid, mood, bass_octave=bass_octave, rng=rng, structure=structure)
 
     if make_pad:
-        tracks["pad"] = _make_pad(chords, grid, mood, pad_octave=pad_octave)
+        tracks["pad"] = _make_pad(chords, grid, mood, pad_octave=pad_octave, structure=structure)
 
     if make_drums:
-        tracks["drums"] = _make_drums(chords, grid, mood, rng=rng)
+        tracks["drums"] = _make_drums(chords, grid, mood, rng=rng, structure=structure)
 
     return Arrangement(tracks=tracks)
 
@@ -75,30 +86,28 @@ def _make_bass(
     *,
     bass_octave: int,
     rng: random.Random,
+    structure: Optional[SongStructure] = None,
 ) -> List[Note]:
-    """
-    Bass groove with pattern variation + approach notes.
-    """
     out: List[Note] = []
 
     base_pitch = 12 * bass_octave
-    center = base_pitch + 16  # ~40 when bass_octave=2
-
-    density = float(mood.rhythm_density)
+    center = base_pitch + 16
     spb = float(grid.seconds_per_beat)
 
     for i, ch in enumerate(chords):
         next_ch = chords[i + 1] if i + 1 < len(chords) else None
-
         root = _nearest_midi_for_pc(ch.root_pc, around=center, lo=28, hi=55)
 
         start_bar = grid.bar_index_at(ch.start)
         end_bar = grid.bar_index_at(max(ch.start, ch.end - 1e-6))
 
         for bar in range(start_bar, end_bar + 1):
+            style = structure.style_for_bar(bar) if structure else None
+            density = float(style.density) if style else float(mood.rhythm_density)
+            inten = float(style.intensity) if style else 0.6
+
             bar_start = grid.time_at(bar, 0.0)
             bar_end = grid.time_at(bar + 1, 0.0)
-
             seg_start = max(ch.start, bar_start)
             seg_end = min(ch.end, bar_end)
             if seg_end <= seg_start:
@@ -106,33 +115,23 @@ def _make_bass(
 
             beats = int(grid.time_signature.numerator)
 
-            # ---- Choose A/B pattern for this bar ----
-            # Deterministic-ish: alternate every 2 bars by phrase, with a tiny random flip when dense.
-            phrase2 = (bar // 2) % 2  # 0,0,1,1,0,0,1,1...
+            phrase2 = (bar // 2) % 2
             variant = "A" if phrase2 == 0 else "B"
             if density >= 0.8 and rng.random() < 0.25:
                 variant = "B" if variant == "A" else "A"
 
             hits: list[tuple[float, str]] = []
-
             if density <= 0.40:
                 hits = [(0.0, "root")]
             elif density <= 0.70:
-                # Mid density: 3–4 hits
-                if variant == "A":
-                    hits = [(0.0, "root"), (1.5, "fifth"), (2.0, "root")]
-                else:
-                    hits = [(0.0, "root"), (1.0, "oct"), (2.0, "root"), (2.5, "fifth")]
+                hits = [(0.0, "root"), (1.5, "fifth"), (2.0, "root")] if variant == "A" \
+                    else [(0.0, "root"), (1.0, "oct"), (2.0, "root"), (2.5, "fifth")]
             else:
-                # High density: more motion, still musical
-                if variant == "A":
-                    hits = [(0.0, "root"), (0.5, "fifth"), (1.0, "root"), (1.5, "oct"),
-                            (2.0, "root"), (2.5, "fifth"), (3.0, "root")]
-                else:
-                    hits = [(0.0, "root"), (0.5, "oct"), (1.0, "root"), (1.5, "fifth"),
-                            (2.0, "root"), (2.5, "oct"), (3.0, "root"), (3.5, "fifth")]
+                hits = [(0.0, "root"), (0.5, "fifth"), (1.0, "root"), (1.5, "oct"),
+                        (2.0, "root"), (2.5, "fifth"), (3.0, "root")] if variant == "A" \
+                    else [(0.0, "root"), (0.5, "oct"), (1.0, "root"), (1.5, "fifth"),
+                          (2.0, "root"), (2.5, "oct"), (3.0, "root"), (3.5, "fifth")]
 
-            # Clamp hits if not 4/4
             hits = [(b, k) for (b, k) in hits if b < beats]
 
             for beat, kind in hits:
@@ -149,12 +148,14 @@ def _make_bass(
                 elif kind == "oct":
                     pitch = min(60, root + 12)
 
-                vel = 96 if beat in (0.0, 2.0) else 88
-                out.append(Note(pitch=int(pitch), start=float(t0), end=float(t1), velocity=int(vel)))
+                base_vel = 70 + int(35 * inten)
+                vel = base_vel + (6 if beat in (0.0, 2.0) else -4)
+                vel = int(max(1, min(127, vel)))
 
-            # Approach note into next chord near the end of the bar (only if next chord exists)
-            if next_ch is not None and beats >= 4:
-                approach_t = bar_start + 3.5 * spb  # "& of 4"
+                out.append(Note(pitch=int(pitch), start=float(t0), end=float(t1), velocity=vel))
+
+            if next_ch is not None and beats >= 4 and density >= 0.45:
+                approach_t = bar_start + 3.5 * spb
                 if seg_start <= approach_t < seg_end:
                     prefer_pcs = set(_ordered_chord_pcs(ch)) | set(_ordered_chord_pcs(next_ch))
                     approach_pitch = _choose_approach_pitch(
@@ -164,17 +165,14 @@ def _make_bass(
                         lo=28,
                         hi=60,
                     )
-                    out.append(
-                        Note(
-                            pitch=int(approach_pitch),
-                            start=float(approach_t),
-                            end=float(min(seg_end, approach_t + 0.30 * spb)),
-                            velocity=82,
-                        )
-                    )
+                    out.append(Note(
+                        pitch=int(approach_pitch),
+                        start=float(approach_t),
+                        end=float(min(seg_end, approach_t + 0.30 * spb)),
+                        velocity=int(max(1, min(127, 58 + int(28 * inten)))),
+                    ))
 
     return out
-
 
 def _choose_approach_pitch(
     *,
@@ -228,30 +226,29 @@ _TRIAD_INTERVALS: dict[str, Tuple[int, int, int]] = {
     "sus4": (0, 5, 7),
 }
 
-
 def _make_pad(
     chords: Sequence[ChordEvent],
     grid: BarGrid,
     mood: MoodPreset,
     *,
     pad_octave: int,
+    structure: Optional[SongStructure] = None,
 ) -> List[Note]:
-    """
-    Sustained block-chord pad with basic voice-leading:
-    choose inversions/voicings that minimize movement from previous chord.
-    """
     out: List[Note] = []
 
-    shift = int(round(float(mood.brightness) * 8))
-    target = 12 * pad_octave + 12 + shift  # around C5-ish
-
     max_notes = 3 if mood.rhythm_density < 0.55 else 4
-
     prev_voicing: Optional[List[int]] = None
 
     for ch in chords:
-        pcs = _ordered_chord_pcs(ch)[:max_notes]
+        bar = grid.bar_index_at(ch.start)
+        style = structure.style_for_bar(bar) if structure else None
 
+        # brightness comes from structure if enabled; otherwise mood.brightness
+        bright = float(style.brightness) if style else float(mood.brightness)
+        shift = int(round(bright * 8))
+        target = 12 * pad_octave + 12 + shift
+
+        pcs = _ordered_chord_pcs(ch)[:max_notes]
         candidates = _voicing_candidates(pcs, around=target, lo=48, hi=92)
         if not candidates:
             continue
@@ -260,13 +257,13 @@ def _make_pad(
             voicing = candidates[0]
         else:
             voicing = min(candidates, key=lambda v: _voicing_cost(v, prev_voicing))
-
         prev_voicing = voicing
 
-        vel = 60 if mood.rhythm_density < 0.55 else 68
+        inten = float(style.intensity) if style else 0.6
+        vel = int(max(40, min(85, 50 + 35 * inten)))
+
         start = ch.start
         end = max(start + 0.08, ch.end - 0.01)
-
         for p in voicing:
             out.append(Note(pitch=p, start=start, end=end, velocity=vel))
 
@@ -347,12 +344,8 @@ def _make_drums(
     grid: BarGrid,
     mood: MoodPreset,
     rng: random.Random,
+    structure: Optional[SongStructure] = None,
 ) -> List[Note]:
-    """
-    Pattern variation:
-    - Alternates Groove A/B every 2 bars (phrase-level variation)
-    - Adds fill variety at phrase ends
-    """
     out: List[Note] = []
 
     total_end = max((c.end for c in chords), default=0.0)
@@ -360,34 +353,35 @@ def _make_drums(
         return out
 
     num_bars = grid.bar_index_at(max(grid.start_time, total_end - 1e-6)) + 1
-
     beats = int(grid.time_signature.numerator)
     spb = float(grid.seconds_per_beat)
-    density = float(mood.rhythm_density)
-
-    # hats: 8ths vs 16ths
-    hat_step_beats = 0.5 if density < 0.75 else 0.25
-
-    # phrase fill cadence
-    fill_every = 8 if density < 0.70 else 4
 
     for bar in range(num_bars):
+        style = structure.style_for_bar(bar) if structure else None
+        density = float(style.density) if style else float(mood.rhythm_density)
+        inten = float(style.intensity) if style else 0.6
+        drums_on = bool(style.drums_enabled) if style else True
+        hat = style.hat if style else "closed"
+        fill_every = int(style.fill_every) if style else (8 if density < 0.70 else 4)
+
+        if not drums_on:
+            continue
+
         bar_start = float(grid.time_at(bar, 0.0))
 
         # Crash at phrase starts
         if bar % 8 == 0:
-            out.append(Note(pitch=CRASH, start=bar_start, end=bar_start + 0.14, velocity=95))
+            out.append(Note(pitch=CRASH, start=bar_start, end=bar_start + 0.14, velocity=90 + int(20 * inten)))
 
-        # Only “good” patterns implemented for 4/4; fallback otherwise
         if beats != 4:
-            _drums_generic_bar(out, bar_start, spb, beats, density, hat_step_beats)
+            _drums_generic_bar(out, bar_start, spb, beats, density, 0.5)
             continue
 
-        # Groove selection: A for bars 0-1, B for bars 2-3, repeat...
+        hat_step_beats = 0.5 if density < 0.75 else 0.25
+        hat_note = CLOSED_HH if hat == "closed" else (RIDE if hat == "ride" else CLOSED_HH)
+
         phrase2 = (bar // 2) % 2
         groove = "A" if phrase2 == 0 else "B"
-
-        # Add a bit of randomness at high density
         if density >= 0.85 and rng.random() < 0.20:
             groove = "B" if groove == "A" else "A"
 
@@ -395,53 +389,49 @@ def _make_drums(
             kick_beats = [0.0, 1.5, 2.0] if density >= 0.55 else [0.0, 2.0]
             snare_beats = [1.0, 3.0]
             ghost_beats = [0.75, 2.75] if density >= 0.45 else []
-            open_hat_beats = [3.5] if density >= 0.75 else []
+            open_hat_beats = [3.5] if (hat != "closed" and density >= 0.70) else []
         else:
-            # Groove B: more syncopation
-            kick_beats = [0.0, 2.5]  # 1 and & of 3
+            kick_beats = [0.0, 2.5]
             if density >= 0.65:
-                kick_beats += [3.0]   # beat 4
+                kick_beats += [3.0]
             if density >= 0.85:
-                kick_beats += [1.0]   # sometimes doubles with snare for drive
+                kick_beats += [1.0]
             snare_beats = [1.0, 3.0]
             ghost_beats = [1.25, 3.25] if density >= 0.5 else []
-            open_hat_beats = [1.5] if density >= 0.75 else []
+            open_hat_beats = [1.5] if (hat != "closed" and density >= 0.70) else []
 
-        # Kicks
+        def v(base: int) -> int:
+            return int(max(1, min(127, base + int(24 * inten))))
+
         for b in kick_beats:
             t0 = bar_start + b * spb
-            out.append(Note(pitch=KICK, start=t0, end=t0 + 0.10, velocity=108))
+            out.append(Note(pitch=KICK, start=t0, end=t0 + 0.10, velocity=v(90)))
 
-        # Snares (backbeat)
         for b in snare_beats:
             t0 = bar_start + b * spb
-            out.append(Note(pitch=SNARE, start=t0, end=t0 + 0.10, velocity=98))
+            out.append(Note(pitch=SNARE, start=t0, end=t0 + 0.10, velocity=v(78)))
 
-        # Ghost snares (soft)
         for b in ghost_beats:
             t0 = bar_start + b * spb
-            out.append(Note(pitch=SNARE, start=t0, end=t0 + 0.07, velocity=38))
+            out.append(Note(pitch=SNARE, start=t0, end=t0 + 0.07, velocity=v(22)))
 
-        # Hats with accents on downbeats
         hb = 0.0
         while hb < beats - 1e-9:
             t0 = bar_start + hb * spb
             on_beat = abs((hb % 1.0) - 0.0) < 1e-6
-            vel = 80 if on_beat else 62
-            out.append(Note(pitch=CLOSED_HH, start=t0, end=t0 + 0.06, velocity=vel))
+            out.append(Note(pitch=hat_note, start=t0, end=t0 + 0.06, velocity=v(58 if on_beat else 44)))
             hb += hat_step_beats
 
-        # Open hats
+        # Open hats if requested
         for b in open_hat_beats:
             t0 = bar_start + b * spb
-            out.append(Note(pitch=OPEN_HH, start=t0, end=t0 + 0.12, velocity=78))
+            out.append(Note(pitch=OPEN_HH, start=t0, end=t0 + 0.12, velocity=v(52)))
 
-        # Fill at phrase end (varied)
+        # Fills at section cadence
         if (bar + 1) % fill_every == 0 and density >= 0.45:
             which = (bar // fill_every) % 3
             if density >= 0.8 and rng.random() < 0.25:
                 which = rng.choice([0, 1, 2])
-
             if which == 0:
                 _add_tom_fill(out, bar_start, spb)
             elif which == 1:
@@ -450,6 +440,7 @@ def _make_drums(
                 _add_kick_run_fill(out, bar_start, spb)
 
     return [n for n in out if n.start >= grid.start_time and n.end > n.start]
+
 
 def _add_tom_fill(out: List[Note], bar_start: float, spb: float) -> None:
     """

@@ -36,6 +36,7 @@ def generate(
     vel_jitter: int = typer.Option(8, "--vel-jitter", help="Velocity jitter amount"),
     swing: float = typer.Option(0.15, "--swing", help="Swing amount 0..1 (offbeat delay)"),
     seed: Optional[int] = typer.Option(None, "--seed", help="Random seed for deterministic humanization"),
+    structure: str = typer.Option("none", "--structure", help="Song structure: none | auto"),
 ):
     """
     Generate a backing track (bass/pad/drums) for a MIDI melody.
@@ -84,6 +85,8 @@ def generate(
         make_bass=not no_bass,
         make_pad=not no_pad,
         make_drums=not no_drums,
+        seed=seed,
+        structure_mode=structure,
     )
 
     if humanize:

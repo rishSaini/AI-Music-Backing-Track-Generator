@@ -53,3 +53,4 @@ data/generated/
 *.wav
 
 data/raw/
+data/datasets/
