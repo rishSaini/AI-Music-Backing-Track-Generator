@@ -32,6 +32,68 @@ def chord_label(root_pc: int, quality: str, extensions: tuple[int, ...]) -> str:
     return name
 
 
+# ----------------------------
+# NEW: match cli.py auto-intro logic
+# ----------------------------
+def _median_pitch(inst: pretty_midi.Instrument) -> float:
+    pitches = sorted(n.pitch for n in inst.notes)
+    if not pitches:
+        return 0.0
+    m = len(pitches)
+    return float(pitches[m // 2]) if (m % 2 == 1) else 0.5 * (pitches[m // 2 - 1] + pitches[m // 2])
+
+
+def _auto_pick_with_intro(
+    pm: pretty_midi.PrettyMIDI,
+    info,
+    melody_inst: pretty_midi.Instrument,
+    sel,
+) -> tuple[list[pretty_midi.Instrument], list[int]]:
+    """
+    Use Fix 2's auto-picked melody_inst as the main lead, but also add
+    a short, high-pitch intro lead track if it exists (like st.mid).
+    Returns (melody_source_insts, picked_intro_idxs).
+    """
+    song_end = float(info.duration) if getattr(info, "duration", 0.0) and info.duration > 1e-6 else float(pm.get_end_time())
+    main_med = _median_pitch(melody_inst)
+
+    intro_candidates: list[tuple[int, float, int]] = []  # (idx, median_pitch, note_count)
+
+    for idx, inst in enumerate(pm.instruments):
+        if idx == sel.instrument_index:
+            continue
+        if inst.is_drum or not inst.notes:
+            continue
+
+        start = min(n.start for n in inst.notes)
+        end = max(n.end for n in inst.notes)
+        span = max(1e-6, end - start)
+        coverage = span / max(1e-6, song_end)
+
+        med = _median_pitch(inst)
+        note_count = len(inst.notes)
+
+        if (
+            start < 2.0
+            and end < 0.25 * song_end
+            and coverage < 0.25
+            and note_count >= 6
+            and med > (main_med + 6)
+        ):
+            intro_candidates.append((idx, med, note_count))
+
+    intro_candidates.sort(key=lambda x: (-x[1], -x[2]))
+    picked_intro_idxs = [idx for (idx, _, _) in intro_candidates[:2]]
+
+    used_indices: list[int] = []
+    for i in picked_intro_idxs + [sel.instrument_index]:
+        if i not in used_indices:
+            used_indices.append(i)
+
+    melody_source_insts = [pm.instruments[i] for i in used_indices]
+    return melody_source_insts, picked_intro_idxs
+
+
 st.set_page_config(
     page_title="AI Backing Track Maker",
     page_icon="🎼",
@@ -139,7 +201,6 @@ def run_pipeline(
     vel_jitter: int,
     swing: float,
 ) -> tuple[Path, dict]:
-    # Save upload to a real temp .mid because our loader expects a path
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mid") as f:
         f.write(midi_bytes)
         in_path = Path(f.name)
@@ -147,15 +208,23 @@ def run_pipeline(
     first_idx = melody_track_indices[0] if melody_track_indices else None
     pm, info, grid, melody_inst, sel = load_and_prepare(in_path, melody_instrument_index=first_idx)
 
+    picked_intro_idxs: list[int] = []
+    used_melody_indices: list[int] = []
+
     # Decide which instruments are the "lead"
     if melody_track_indices:
-        valid = []
+        valid: list[int] = []
         for i in melody_track_indices:
             if 0 <= i < len(pm.instruments):
                 valid.append(i)
-        melody_source_insts = [pm.instruments[i] for i in sorted(set(valid))] if valid else [melody_inst]
+        used_melody_indices = sorted(set(valid)) if valid else [sel.instrument_index]
+        melody_source_insts = [pm.instruments[i] for i in used_melody_indices]
     else:
-        melody_source_insts = [melody_inst]
+        melody_source_insts, picked_intro_idxs = _auto_pick_with_intro(pm, info, melody_inst, sel)
+        # resolve indices we used (in order)
+        for i, inst in enumerate(pm.instruments):
+            if any(inst is x for x in melody_source_insts):
+                used_melody_indices.append(i)
 
     # Combine selected lead instruments for analysis (key/chords)
     analysis_inst = pretty_midi.Instrument(
@@ -168,7 +237,6 @@ def run_pipeline(
 
     mel_cfg = MelodyConfig(quantize_to_beat=quantize_melody)
     melody_notes = extract_melody_notes(analysis_inst, grid=grid, config=mel_cfg)
-
     if not melody_notes:
         raise RuntimeError("No melody notes extracted. Try selecting a different melody track (or multiple tracks).")
 
@@ -213,14 +281,12 @@ def run_pipeline(
 
     out_path = Path(tempfile.mkstemp(suffix=".mid")[1])
 
-    # If render.py deep-copies melody_source_insts, the program is already preserved,
-    # but keeping this is harmless.
     render_cfg = RenderConfig(melody_program=int(melody_source_insts[0].program))
 
-    # We pass empty melody_notes because we render the lead from the original instrument(s)
+    # Render the lead from original instrument(s)
     write_midi(
         out_path,
-        [],  # ignored when melody_source_insts is provided
+        [],
         arrangement,
         info,
         config=render_cfg,
@@ -231,6 +297,8 @@ def run_pipeline(
         "info": info,
         "selection": sel,
         "selected_melody_indices": melody_track_indices,
+        "used_melody_indices": used_melody_indices,
+        "auto_intro_indices": picked_intro_idxs,
         "used_melody_track_names": [inst.name or "(unnamed)" for inst in melody_source_insts],
         "melody_note_count": len(melody_notes),
         "raw_key": raw_key,
@@ -258,6 +326,9 @@ if uploaded is not None:
         tmp_path, melody_instrument_index=None
     )
 
+    # NEW: show which intro tracks auto-mode will include
+    _, intro_preview = _auto_pick_with_intro(pm_preview, info_preview, melody_inst_preview, sel_preview)
+
     with left:
         st.markdown('<div class="card" style="margin-top: 14px;">', unsafe_allow_html=True)
         st.subheader("3) Melody track(s)")
@@ -276,7 +347,13 @@ if uploaded is not None:
 
         if use_auto:
             melody_track_indices = None
-            st.caption(f"Auto-picked: idx={sel_preview.instrument_index}, name='{sel_preview.instrument_name}'")
+            if intro_preview:
+                st.caption(
+                    f"Auto-picked main: idx={sel_preview.instrument_index}, name='{sel_preview.instrument_name}' "
+                    f"(+ intro tracks: {intro_preview})"
+                )
+            else:
+                st.caption(f"Auto-picked: idx={sel_preview.instrument_index}, name='{sel_preview.instrument_name}'")
         else:
             picked = st.multiselect(
                 "Choose melody instrument(s) (pick ALL tracks that contain the lead)",
@@ -344,8 +421,15 @@ if generate_btn and uploaded is not None:
         if meta["selected_melody_indices"]:
             st.markdown(f"**Melody tracks (manual):** {meta['selected_melody_indices']}")
         else:
-            st.markdown(f"**Melody track (auto):** idx={sel.instrument_index} · `{sel.instrument_name}`")
+            if meta["auto_intro_indices"]:
+                st.markdown(
+                    f"**Melody tracks (auto):** main idx={sel.instrument_index} · `{sel.instrument_name}` "
+                    f"(+ intro: {meta['auto_intro_indices']})"
+                )
+            else:
+                st.markdown(f"**Melody track (auto):** idx={sel.instrument_index} · `{sel.instrument_name}`")
 
+        st.markdown(f"**Used melody indices:** {meta['used_melody_indices']}")
         st.markdown(f"**Melody notes extracted (for analysis):** `{meta['melody_note_count']}`")
 
         st.markdown(f"**Detected key:** {key_to_string(meta['raw_key'])}")

@@ -370,8 +370,12 @@ def _make_drums_ml(
 ) -> List[Note]:
     """
     ML drums generator.
-    Uses your trained model (data/ml/drum_model.pt) to generate num_bars bars,
-    then optionally applies section rules (intro no-drums, ride in chorus, intensity scaling).
+
+    Uses ml_drums.infer's groove constraints (locked hats, forced backbeat, crash restrictions, etc.)
+    to avoid chaotic patterns.
+
+    If structure is enabled, we ALSO inject section-aware crashes/fills (predictable + musical),
+    then dedupe any overlapping hits.
     """
     # Lazy import so torch isn’t required unless you actually use ML drums
     from backingtrack.ml_drums.infer import SampleConfig, generate_ml_drums
@@ -381,7 +385,13 @@ def _make_drums_ml(
         temperature=float(temperature),
         stochastic=True,
         seed=seed,
-        intensity=1.0,  # we’ll scale per-bar below using structure intensity
+        intensity=1.0,          # we’ll scale per-bar below using structure intensity
+        hat_step=2,             # clean 8th hats by default
+        fill_every_bars=8,
+        crash_every_bars=8,
+        reuse_groove=True,
+        groove_mutation=0.12,
+        enable_ml_fills=False,  # fills injected below (more controlled)
     )
 
     notes = generate_ml_drums(model_path, grid, scfg=scfg)
@@ -389,32 +399,75 @@ def _make_drums_ml(
     if not structure:
         return notes
 
+    spb = float(grid.seconds_per_beat)
+
     out: List[Note] = []
+
+    # 1) Apply per-bar structure rules (intro no-drums, hat choice, intensity scaling)
     for n in notes:
         bar = grid.bar_index_at(n.start)
         st = structure.style_for_bar(bar)
 
-        # Respect intro sections where drums are off
         if not st.drums_enabled:
             continue
 
-        pitch = n.pitch
+        pitch = int(n.pitch)
 
-        # Very simple “hat type” enforcement:
-        # if section wants ride, convert closed hats to ride
+        # Hat type enforcement:
         if st.hat == "ride" and pitch == CLOSED_HH:
             pitch = RIDE
         if st.hat == "closed" and pitch == RIDE:
             pitch = CLOSED_HH
 
-        # Scale velocity by section intensity (keeps chorus hotter than verse)
         inten = float(st.intensity)
-        scale = 0.55 + 0.70 * inten  # ~0.8 in verses, ~1.1 in choruses
-        vel = int(max(1, min(127, round(n.velocity * scale))))
+        scale = 0.55 + 0.70 * inten
+        vel = int(max(1, min(127, round(int(n.velocity) * scale))))
 
-        out.append(Note(pitch=int(pitch), start=float(n.start), end=float(n.end), velocity=int(vel)))
+        out.append(Note(pitch=pitch, start=float(n.start), end=float(n.end), velocity=vel))
 
-    return out
+    # 2) Inject predictable phrase energy: crash at phrase starts + fills on cadence bars
+    for bar in range(int(num_bars)):
+        st = structure.style_for_bar(bar)
+        if not st.drums_enabled:
+            continue
+
+        bar_start = float(grid.time_at(bar, 0.0))
+        inten = float(st.intensity)
+        density = float(st.density)
+        fill_every = int(st.fill_every) if int(st.fill_every) > 0 else 8
+
+        def _v(base: int) -> int:
+            return int(max(1, min(127, base + int(22 * inten))))
+
+        if bar % 8 == 0:
+            out.append(Note(pitch=CRASH, start=bar_start, end=bar_start + 0.14, velocity=_v(90)))
+
+        if (bar + 1) % fill_every == 0 and density >= 0.45:
+            which = (bar // fill_every) % 3
+            if which == 0:
+                _add_tom_fill(out, bar_start, spb)
+            elif which == 1:
+                _add_snare_roll_fill(out, bar_start, spb)
+            else:
+                _add_kick_run_fill(out, bar_start, spb)
+
+    # 3) Dedupe exact overlaps (same pitch at same time)
+    def _dedupe(notes_in: List[Note]) -> List[Note]:
+        best: Dict[Tuple[int, int], Note] = {}
+        for n in notes_in:
+            key = (int(round(float(n.start) * 1000.0)), int(n.pitch))
+            prev = best.get(key)
+            if prev is None:
+                best[key] = n
+            else:
+                vel = max(int(prev.velocity), int(n.velocity))
+                end = max(float(prev.end), float(n.end))
+                best[key] = Note(pitch=int(n.pitch), start=float(prev.start), end=float(end), velocity=int(vel))
+        out_notes = list(best.values())
+        out_notes.sort(key=lambda x: (x.start, x.pitch))
+        return out_notes
+
+    return _dedupe(out)
 
 def _make_drums(
     chords: Sequence[ChordEvent],

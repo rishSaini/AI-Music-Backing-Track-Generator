@@ -86,8 +86,14 @@ def build_pretty_midi(
             lead = deepcopy(src)
             lead.is_drum = False
             lead.name = DEFAULT_NAMES["melody"] if len(melody_source_insts) == 1 else f"Melody {j + 1}"
-            # NOTE: we keep each instrument’s original program by default.
+
+            # Make event ordering deterministic + player-safe
+            lead.notes.sort(key=lambda x: (x.start, x.pitch))
+            lead.control_changes.sort(key=lambda cc: cc.time)
+            lead.pitch_bends.sort(key=lambda pb: pb.time)
+
             pm.instruments.append(lead)
+
     elif melody_notes:
         pm.instruments.append(
             _notes_to_instrument(

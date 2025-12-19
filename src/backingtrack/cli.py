@@ -31,6 +31,13 @@ def _parse_indices(csv: Optional[str]) -> list[int]:
         out.append(int(part))
     return sorted(set(out))
 
+def _median_pitch(inst: pretty_midi.Instrument) -> float:
+    pitches = sorted(n.pitch for n in inst.notes)
+    if not pitches:
+        return 0.0
+    m = len(pitches)
+    return float(pitches[m // 2]) if (m % 2 == 1) else 0.5 * (pitches[m // 2 - 1] + pitches[m // 2])
+
 @app.command()
 def generate(
     input_midi: Path = typer.Argument(..., exists=True, readable=True, help="Input MIDI file (.mid/.midi)"),
@@ -69,8 +76,56 @@ def generate(
         melody_source_insts = [pm.instruments[i] for i in requested]
         typer.echo(f"Using melody tracks (lead): {requested}")
     else:
+        # Main lead from Fix 2
         melody_source_insts = [melody_inst]
-        typer.echo(f"Auto-picked melody track: idx={sel.instrument_index}, name='{sel.instrument_name}', is_drum={sel.is_drum}")
+
+        # ---- NEW: also try to auto-include a short high-pitch intro lead track ----
+        song_end = float(info.duration) if info.duration > 1e-6 else float(pm.get_end_time())
+        main_med = _median_pitch(melody_inst)
+
+        intro_candidates: list[tuple[int, float, int]] = []  # (idx, median_pitch, note_count)
+
+        for idx, inst in enumerate(pm.instruments):
+            if idx == sel.instrument_index:
+                continue
+            if inst.is_drum or not inst.notes:
+                continue
+
+            start = min(n.start for n in inst.notes)
+            end = max(n.end for n in inst.notes)
+            span = max(1e-6, end - start)
+            coverage = span / max(1e-6, song_end)
+
+            med = _median_pitch(inst)
+            note_count = len(inst.notes)
+
+            # Heuristic for "intro hook" tracks:
+            # - starts near the beginning
+            # - ends early in the song
+            # - relatively short coverage
+            # - meaningfully higher than the main lead
+            if (
+                start < 2.0
+                and end < 0.25 * song_end
+                and coverage < 0.25
+                and note_count >= 6
+                and med > (main_med + 6)
+            ):
+                intro_candidates.append((idx, med, note_count))
+
+        # Keep the best 1–2 intro candidates
+        intro_candidates.sort(key=lambda x: (-x[1], -x[2]))
+        picked_intro_idxs = [idx for (idx, _, _) in intro_candidates[:2]]
+
+        # Put intro tracks first so they play upfront
+        if picked_intro_idxs:
+            melody_source_insts = [pm.instruments[i] for i in picked_intro_idxs] + melody_source_insts
+
+        typer.echo(
+            f"Auto-picked melody track: idx={sel.instrument_index}, name='{sel.instrument_name}', is_drum={sel.is_drum}"
+            + (f" | plus intro tracks: {picked_intro_idxs}" if picked_intro_idxs else "")
+        )
+
 
     typer.echo(f"Tempo: {info.tempo_bpm:.2f} BPM | Time signature: {info.time_signature.numerator}/{info.time_signature.denominator}")
     typer.echo(f"Duration: {info.duration:.2f}s")

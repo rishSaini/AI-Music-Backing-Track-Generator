@@ -97,16 +97,12 @@ def pick_melody_instrument(
     """
     Choose which instrument track is "the melody".
 
-    Options:
-    - If instrument_index is provided: pick that exact instrument.
-    - Otherwise: use a heuristic that usually picks the lead line.
+    If instrument_index is provided: pick that exact instrument.
+    Otherwise: score tracks and pick the most "lead-like" one.
 
-    Heuristic (simple but effective):
-    - ignore drum tracks
-    - ignore tracks with zero notes
-    - favor instruments with higher pitch distributions (melodies tend to be higher)
-    - lightly penalize names that look like 'bass', 'pad', 'chord'
-    - lightly reward names that look like 'lead', 'melody', 'vocal'
+    Key improvement:
+    - prefer instruments that span a large portion of the song (coverage),
+      so we don't accidentally pick a 3-second intro hook track.
     """
     instruments = pm.instruments
     if not instruments:
@@ -131,6 +127,8 @@ def pick_melody_instrument(
     best_idx = None
     best_score = -1e18
 
+    song_end = float(pm.get_end_time()) or 1.0
+
     for idx, inst in enumerate(instruments):
         if inst.is_drum:
             continue
@@ -138,36 +136,51 @@ def pick_melody_instrument(
             continue
 
         pitches = np.array([n.pitch for n in inst.notes], dtype=np.float32)
-
-        # Stats that help identify "lead-ness"
-        median_pitch = float(np.median(pitches))
-        p90_pitch = float(np.percentile(pitches, 90))
         note_count = len(inst.notes)
 
-        # Track-name hints (very useful in real MIDI files)
+        inst_start = float(min(n.start for n in inst.notes))
+        inst_end = float(max(n.end for n in inst.notes))
+        span = max(1e-6, inst_end - inst_start)
+
+        # How much of the song this instrument covers (0..1)
+        coverage = span / max(1e-6, song_end)
+        # How close it gets to the end (0..1)
+        end_ratio = inst_end / max(1e-6, song_end)
+
+        # Pitch stats (melody tends to be higher)
+        median_pitch = float(np.median(pitches))
+        p90_pitch = float(np.percentile(pitches, 90))
+
+        # Track-name hints
         name = (inst.name or "").strip().lower()
         penalty = 0.0
         bonus = 0.0
 
-        #TODO: code from 153 - 161 is questionable, some of the "bad" insts could be rewaeded as well.
-        # Penalize typical accompaniment track names
-        for bad in ("bass", "pad", "chord", "harmony", "accomp", "comp", "rhythm", "guitar"):
+        # Penalize typical accompaniment names
+        # NOTE: removed "guitar" because guitar is often the lead.
+        for bad in ("bass", "pad", "chord", "harmony", "accomp", "comp", "rhythm"):
             if bad in name:
                 penalty += 20.0
 
-        # Reward typical melody track names
+        # Reward typical melody names
         for good in ("melody", "lead", "vocal", "voice", "solo", "theme"):
             if good in name:
                 bonus += 25.0
 
-        # Core idea: melody tends to be higher AND present.
-        # note_count helps avoid picking a tiny high-pitched FX track.
+        # Strongly discourage tiny intro/FX tracks
+        short_pen = 0.0
+        if coverage < 0.20:
+            short_pen = 120.0 * (0.20 - coverage) / 0.20  # up to -120
+
         score = (
             1.0 * median_pitch
             + 0.7 * p90_pitch
-            + 5.0 * np.log1p(note_count)   # grows slowly; prevents huge domination
+            + 5.0 * np.log1p(note_count)
+            + 110.0 * coverage
+            + 25.0 * end_ratio
             + bonus
             - penalty
+            - short_pen
         )
 
         if score > best_score:
