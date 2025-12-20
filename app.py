@@ -1,8 +1,6 @@
 # app.py
 from __future__ import annotations
 
-from backingtrack.ml_harmony.infer import predict_chords_ml
-
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -12,6 +10,7 @@ import streamlit as st
 
 from backingtrack.arrange import arrange_backing
 from backingtrack.harmony_baseline import generate_chords
+from backingtrack.ml_harmony.steps_infer import ChordSampleConfig, generate_chords_ml_steps
 from backingtrack.humanize import HumanizeConfig, humanize_arrangement
 from backingtrack.key_detect import estimate_key, key_to_string
 from backingtrack.melody import MelodyConfig, extract_melody_notes
@@ -145,7 +144,46 @@ with left:
         index=moods.index("neutral") if "neutral" in moods else 0,
     )
 
-    bars_per_chord = st.slider("Bars per chord", min_value=1, max_value=4, value=1, step=1)
+    st.markdown("**Harmony (chords)**")
+    harmony_mode = st.selectbox("Chord generator", ["baseline (rules)", "ml (transformer)"], index=0)
+
+    # Defaults (used even if hidden)
+    chord_model_path = "data/ml/chord_model_new.pt"
+    chord_step_beats = 2.0
+    chord_include_key = True
+    chord_stochastic = False
+    chord_temp = 1.0
+    chord_top_k = 12
+    chord_repeat_penalty = 1.2
+    chord_change_penalty = 0.15
+
+    if harmony_mode.startswith("ml"):
+        chord_model_path = st.text_input("Chord model path", value=chord_model_path)
+        chord_step_beats = float(
+            st.selectbox("Chord step size (beats)", [1.0, 2.0, 4.0], index=1)
+        )
+        chord_include_key = st.toggle("Include key features (recommended)", value=True)
+
+        chord_stochastic = st.toggle("Stochastic chords (more variety)", value=False)
+        chord_temp = st.slider("Chord temperature", 0.7, 1.6, 1.0, 0.01)
+        chord_top_k = st.slider("Chord top-k (0 = no top-k)", 0, 40, 12, 1)
+        chord_repeat_penalty = st.slider("Chord repeat penalty", 0.0, 3.0, 1.2, 0.05)
+        chord_change_penalty = st.slider(
+            "Chord smoothness (change penalty)",
+            0.0,
+            0.6,
+            0.15,
+            0.01,
+            disabled=chord_stochastic,
+        )
+
+        # Keep the baseline control visible but disabled, so users understand it's not used.
+        bars_per_chord = st.slider(
+            "Bars per chord (baseline only)", min_value=1, max_value=4, value=1, step=1, disabled=True
+        )
+    else:
+        bars_per_chord = st.slider("Bars per chord", min_value=1, max_value=4, value=1, step=1)
+
     quantize_melody = st.toggle("Quantize melody to beat grid", value=False)
 
     st.divider()
@@ -170,18 +208,6 @@ with left:
     drums_mode = st.selectbox("Drums", ["rules", "ml"], index=0)
     ml_temp = st.slider("ML drum temperature", 0.8, 1.4, 1.05, 0.01)
 
-    harmony_mode = st.selectbox("Harmony (chords)", ["baseline", "ml"], index=0)
-
-    ml_chord_model_path = "data/ml/chord_model.pt"
-    ml_chord_change_penalty = 0.6
-    ml_chord_include_key = True
-
-    if harmony_mode == "ml":
-        ml_chord_model_path = st.text_input("Chord model path", value="data/ml/chord_model.pt")
-        ml_chord_change_penalty = st.slider("Chord smoothing (change penalty)", 0.0, 2.0, 0.6, 0.05)
-        ml_chord_include_key = st.toggle("Chord model uses key features", value=True)
-
-
     st.markdown("</div>", unsafe_allow_html=True)
 
     generate_btn = st.button("✨ Generate backing track", use_container_width=True, disabled=(uploaded is None))
@@ -200,6 +226,15 @@ def run_pipeline(
     midi_bytes: bytes,
     *,
     mood_name: str,
+    harmony_mode: str,
+    chord_model_path: str,
+    chord_step_beats: float,
+    chord_include_key: bool,
+    chord_stochastic: bool,
+    chord_temp: float,
+    chord_top_k: int,
+    chord_repeat_penalty: float,
+    chord_change_penalty: float,
     bars_per_chord: int,
     quantize_melody: bool,
     make_bass: bool,
@@ -214,10 +249,6 @@ def run_pipeline(
     jitter_ms: float,
     vel_jitter: int,
     swing: float,
-    harmony_mode: str,
-    ml_chord_model_path: str,
-    ml_chord_change_penalty: float,
-    ml_chord_include_key: bool,
 ) -> tuple[Path, dict]:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mid") as f:
         f.write(midi_bytes)
@@ -262,14 +293,22 @@ def run_pipeline(
     raw_key = estimate_key(melody_notes)
     key = apply_mood_to_key(raw_key, mood)
 
-    if harmony_mode == "ml":
-        chords = predict_chords_ml(
+    if str(harmony_mode).startswith("ml"):
+        chords = generate_chords_ml_steps(
             melody_notes=melody_notes,
             grid=grid,
-            duration_seconds=info.duration,
-            model_path=ml_chord_model_path,
-            include_key=ml_chord_include_key,
-            change_penalty=ml_chord_change_penalty,
+            duration_seconds=float(info.duration),
+            model_path=str(chord_model_path),
+            cfg=ChordSampleConfig(
+                step_beats=float(chord_step_beats),
+                include_key=bool(chord_include_key),
+                stochastic=bool(chord_stochastic),
+                temperature=float(chord_temp),
+                top_k=int(chord_top_k),
+                repeat_penalty=float(chord_repeat_penalty),
+                change_penalty=float(chord_change_penalty),
+                seed=seed,
+            ),
         )
     else:
         chords = generate_chords(
@@ -280,7 +319,6 @@ def run_pipeline(
             melody_notes=melody_notes,
             bars_per_chord=bars_per_chord,
         )
-
 
     arrangement = arrange_backing(
         chords=chords,
@@ -333,6 +371,14 @@ def run_pipeline(
         "raw_key": raw_key,
         "key": key,
         "mood": mood,
+        "harmony_mode": harmony_mode,
+        "chord_model_path": str(chord_model_path),
+        "chord_step_beats": float(chord_step_beats),
+        "chord_stochastic": bool(chord_stochastic),
+        "chord_temperature": float(chord_temp),
+        "chord_top_k": int(chord_top_k),
+        "chord_repeat_penalty": float(chord_repeat_penalty),
+        "chord_change_penalty": float(chord_change_penalty),
         "chords": chords,
         "arrangement_counts": {k: len(v) for k, v in arrangement.tracks.items()},
         "instrument_list": [
@@ -417,6 +463,15 @@ if generate_btn and uploaded is not None:
                 out_path, meta = run_pipeline(
                     midi_bytes=uploaded.getvalue(),
                     mood_name=mood_name,
+                    harmony_mode=harmony_mode,
+                    chord_model_path=chord_model_path,
+                    chord_step_beats=float(chord_step_beats),
+                    chord_include_key=bool(chord_include_key),
+                    chord_stochastic=bool(chord_stochastic),
+                    chord_temp=float(chord_temp),
+                    chord_top_k=int(chord_top_k),
+                    chord_repeat_penalty=float(chord_repeat_penalty),
+                    chord_change_penalty=float(chord_change_penalty),
                     bars_per_chord=bars_per_chord,
                     quantize_melody=quantize_melody,
                     make_bass=make_bass,
@@ -431,11 +486,6 @@ if generate_btn and uploaded is not None:
                     jitter_ms=jitter_ms,
                     vel_jitter=int(vel_jitter),
                     swing=float(swing),
-                    harmony_mode=harmony_mode,
-                    ml_chord_model_path=ml_chord_model_path,
-                    ml_chord_change_penalty=ml_chord_change_penalty,
-                    ml_chord_include_key=ml_chord_include_key,
-
                 )
         except Exception as e:
             st.error(f"Generation failed: {e}")

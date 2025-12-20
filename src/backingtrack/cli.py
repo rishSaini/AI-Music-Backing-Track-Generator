@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from .ml_harmony.infer import predict_chords_ml
-
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +13,7 @@ from .melody import MelodyConfig, extract_melody_notes
 from .key_detect import estimate_key, key_to_string
 from .moods import apply_mood_to_key, get_mood, list_moods
 from .harmony_baseline import generate_chords
+from .ml_harmony.steps_infer import ChordSampleConfig, generate_chords_ml_steps
 from .arrange import arrange_backing
 from .render import RenderConfig, write_midi
 from .humanize import HumanizeConfig, humanize_arrangement
@@ -51,6 +50,15 @@ def generate(
         help="Comma-separated instrument indices to render as the lead (e.g. 0,2,5). If omitted, auto-pick is used.",
     ),
     bars_per_chord: int = typer.Option(1, "--bars-per-chord", help="How many bars each chord lasts"),
+    harmony_mode: str = typer.Option("baseline", "--harmony-mode", help="Chords: baseline | ml"),
+    chord_model: Path = typer.Option(Path("data/ml/chord_model_new.pt"), "--chord-model", help="Path to ML chord model (.pt)"),
+    chord_step_beats: float = typer.Option(2.0, "--chord-step-beats", help="Chord model step size in beats (must match preprocessing)"),
+    chord_include_key: bool = typer.Option(True, "--chord-include-key/--no-chord-include-key", help="Include key features in ML chord model"),
+    chord_stochastic: bool = typer.Option(False, "--chord-stochastic/--no-chord-stochastic", help="Sample chords stochastically (more variety)"),
+    chord_temp: float = typer.Option(1.0, "--chord-temp", help="Chord model temperature (if harmony_mode=ml)"),
+    chord_top_k: int = typer.Option(12, "--chord-top-k", help="Chord model top-k (0 = no top-k truncation)"),
+    chord_repeat_penalty: float = typer.Option(1.2, "--chord-repeat-penalty", help="Penalty for repeating the same chord (if stochastic)"),
+    chord_change_penalty: float = typer.Option(0.15, "--chord-change-penalty", help="Change penalty for smoothing (if not stochastic)"),
     quantize_melody: bool = typer.Option(False, "--quantize-melody", help="Quantize melody note times to the beat grid"),
     no_drums: bool = typer.Option(False, "--no-drums", help="Disable drum track generation"),
     no_bass: bool = typer.Option(False, "--no-bass", help="Disable bass track generation"),
@@ -63,10 +71,6 @@ def generate(
     structure: str = typer.Option("none", "--structure", help="Song structure: none | auto"),
     drums_mode: str = typer.Option("rules", "--drums-mode", help="Drums: rules | ml"),
     ml_temp: float = typer.Option(1.05, "--ml-temp", help="ML drum temperature (if drums_mode=ml)"),
-    harmony_mode: str = typer.Option("baseline", "--harmony-mode", help="Harmony: baseline | ml"),
-    chord_model: str = typer.Option("data/ml/chord_model.pt", "--chord-model", help="ML chord model path"),
-    chord_change_penalty: float = typer.Option(0.6, "--chord-change-penalty", help="Smoothing penalty for chord changes"),
-    chord_include_key: bool = typer.Option(True, "--chord-include-key/--no-chord-include-key", help="Model expects key features"),
 ):
     # Load + auto-pick melody for baseline metadata/grid
     requested = _parse_indices(melody_tracks)
@@ -156,16 +160,24 @@ def generate(
     if key != raw_key:
         typer.echo(f"After mood '{mood_preset.name}' bias: {key_to_string(key)}")
 
-    if harmony_mode == "ml":
-        chords = predict_chords_ml(
+    if str(harmony_mode).startswith("ml"):
+        chords = generate_chords_ml_steps(
             melody_notes=melody_notes,
             grid=grid,
-            duration_seconds=info.duration,
-            model_path=chord_model,
-            include_key=chord_include_key,
-            change_penalty=chord_change_penalty,
+            duration_seconds=float(info.duration),
+            model_path=str(chord_model),
+            cfg=ChordSampleConfig(
+                step_beats=float(chord_step_beats),
+                include_key=bool(chord_include_key),
+                stochastic=bool(chord_stochastic),
+                temperature=float(chord_temp),
+                top_k=int(chord_top_k),
+                repeat_penalty=float(chord_repeat_penalty),
+                change_penalty=float(chord_change_penalty),
+                seed=seed,
+            ),
         )
-        typer.echo(f"Chords (ML) generated: {len(chords)}")
+        typer.echo(f"Chords generated: {len(chords)} (ML, step_beats={chord_step_beats})")
     else:
         chords = generate_chords(
             key=key,
@@ -175,7 +187,7 @@ def generate(
             melody_notes=melody_notes,
             bars_per_chord=bars_per_chord,
         )
-        typer.echo(f"Chords (baseline) generated: {len(chords)} (bars_per_chord={bars_per_chord})")
+        typer.echo(f"Chords generated: {len(chords)} (baseline, bars_per_chord={bars_per_chord})")
 
     arrangement = arrange_backing(
         chords=chords,
