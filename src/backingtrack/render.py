@@ -12,11 +12,13 @@ from .arrange import Arrangement, TrackName
 from .types import MidiInfo, Note, TimeSignature
 
 # Reasonable GM programs (0-127). These are General MIDI instrument programs:
-# 0 = Acoustic Grand Piano, 33 = Electric Bass (finger), 48 = Strings Ensemble 1
+# 0 = Acoustic Grand Piano, 33 = Electric Bass (finger), 4 = Electric Piano 1
 DEFAULT_PROGRAMS: Dict[str, int] = {
     "melody": 0,
     "bass": 33,
-    "pad": 48,
+    # Changed default pad from Strings(48) to Electric Piano 1(4) to reduce "synth pad" feel
+    # (Still fully user-configurable via RenderConfig.pad_program)
+    "pad": 4,
 }
 
 DEFAULT_NAMES: Dict[str, str] = {

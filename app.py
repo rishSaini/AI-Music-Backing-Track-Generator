@@ -34,7 +34,40 @@ def chord_label(root_pc: int, quality: str, extensions: tuple[int, ...]) -> str:
 
 
 # ----------------------------
-# Auto-pick helpers (existing)
+# GM Instrument presets
+# ----------------------------
+PAD_PRESETS = [
+    ("Electric Piano 1", 4),
+    ("Electric Piano 2", 5),
+    ("Acoustic Grand Piano", 0),
+    ("Acoustic Guitar (nylon)", 24),
+    ("Acoustic Guitar (steel)", 25),
+    ("Electric Guitar (clean)", 27),
+    ("Strings Ensemble 1", 48),
+    ("Choir Aahs", 52),
+    ("Brass Section", 61),
+    ("Synth Pad 2 (warm)", 89),
+    ("Synth Pad 1 (new age)", 88),
+]
+
+BASS_PRESETS = [
+    ("Electric Bass (finger)", 33),
+    ("Electric Bass (pick)", 34),
+    ("Acoustic Bass", 32),
+    ("Synth Bass 1", 38),
+    ("Synth Bass 2", 39),
+]
+
+
+def _preset_index(presets: list[tuple[str, int]], program: int) -> int:
+    for i, (_, p) in enumerate(presets):
+        if int(p) == int(program):
+            return i
+    return 0
+
+
+# ----------------------------
+# Auto-pick helpers
 # ----------------------------
 def _median_pitch(inst: pretty_midi.Instrument) -> float:
     pitches = sorted(n.pitch for n in inst.notes)
@@ -95,13 +128,17 @@ def _auto_pick_with_intro(
 
 
 # ----------------------------
-# Auto settings (new)
+# Auto settings (kept)
 # ----------------------------
 @st.cache_data(show_spinner=False)
 def recommend_settings(midi_bytes: bytes) -> Dict[str, Any]:
     """
-    Heuristic 'auto' settings. No training required.
-    Returns a dict of session_state keys -> values.
+    Heuristic 'auto' settings.
+    Project preference:
+      - Chords default to RULES
+      - Drums default to ML
+
+    NOTE: We intentionally do NOT set pad/bass program here so user selection persists.
     """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mid") as f:
         f.write(midi_bytes)
@@ -127,13 +164,7 @@ def recommend_settings(midi_bytes: bytes) -> Dict[str, Any]:
     dense = notes_per_sec >= 3.0 or n_notes >= 450
     sparse = notes_per_sec <= 1.2 and n_notes <= 140
 
-    ts = getattr(info, "time_signature", None)
-    is_44 = True
-    if ts is not None:
-        is_44 = (getattr(ts, "numerator", 4) == 4) and (getattr(ts, "denominator", 4) == 4)
-
-    # chords
-    harmony_mode = "baseline (rules)" if (dense or fast) else "ml (transformer)"
+    harmony_mode = "baseline (rules)"
     bars_per_chord = 2 if slow else 1
 
     chord_step_beats = 4.0 if slow else 2.0
@@ -158,18 +189,14 @@ def recommend_settings(midi_bytes: bytes) -> Dict[str, Any]:
         chord_repeat_penalty = 1.15
         chord_change_penalty = 0.22
 
-    # drums
-    if (not is_44) or dense or fast:
-        drums_mode = "rules"
+    drums_mode = "ml"
+    if fast or sparse:
         ml_temp = 1.05
     else:
-        drums_mode = "ml"
-        ml_temp = 1.00 if not sparse else 1.05
+        ml_temp = 1.00
 
-    # melody preprocessing
     quantize_melody = bool(dense and bpm >= 110.0)
 
-    # humanize
     humanize = True
     jitter_ms = 10.0 if fast else (18.0 if slow else 15.0)
     vel_jitter = 6 if fast else (10 if slow else 8)
@@ -227,11 +254,10 @@ st.caption("Upload a MIDI melody → generate a backing track (bass/pad/drums) �
 
 left, right = st.columns([0.42, 0.58], gap="large")
 
-# Session defaults
 DEFAULTS: Dict[str, Any] = {
     "mood_name": "neutral",
     "auto_settings": True,
-    "harmony_mode": "baseline (rules)",
+    "harmony_mode": "baseline (rules)",   # chords default = rules
     "bars_per_chord": 1,
     "chord_model_path": "data/ml/chord_model_new.pt",
     "chord_step_beats": 2.0,
@@ -242,8 +268,8 @@ DEFAULTS: Dict[str, Any] = {
     "chord_repeat_penalty": 1.2,
     "chord_change_penalty": 0.15,
     "quantize_melody": False,
-    "drums_mode": "rules",
-    "ml_temp": 1.05,
+    "drums_mode": "ml",                  # drums default = ML
+    "ml_temp": 1.00,
     "humanize": True,
     "jitter_ms": 15.0,
     "vel_jitter": 8,
@@ -254,6 +280,11 @@ DEFAULTS: Dict[str, Any] = {
     "make_bass": True,
     "make_pad": True,
     "make_drums": True,
+    # NEW: instrument programs
+    "pad_program": 4,    # Electric Piano 1
+    "bass_program": 33,  # Electric Bass (finger)
+    "pad_custom_on": False,
+    "bass_custom_on": False,
 }
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
@@ -268,21 +299,21 @@ with left:
     st.subheader("2) Controls")
 
     moods = list_moods()
-    mood_name = st.selectbox(
+    st.selectbox(
         "Mood",
         moods,
         index=moods.index(st.session_state["mood_name"]) if st.session_state["mood_name"] in moods else 0,
         key="mood_name",
     )
 
-    auto_settings = st.toggle(
+    st.toggle(
         "Auto choose settings",
         value=bool(st.session_state["auto_settings"]),
         key="auto_settings",
         help="Picks good defaults for this MIDI. You can override anything in Advanced controls.",
     )
 
-    if uploaded is not None and auto_settings:
+    if uploaded is not None and st.session_state["auto_settings"]:
         midi_bytes = uploaded.getvalue()
         file_sig = hashlib.sha1(midi_bytes).hexdigest()
         reco = recommend_settings(midi_bytes)
@@ -297,18 +328,17 @@ with left:
 
         _apply_auto_settings(reco, file_sig=file_sig, force=bool(reapply))
 
-    # Simple surface controls
-    auto_sections = st.toggle(
+    st.toggle(
         "Auto song sections (intro/verse/chorus/outro)",
         value=bool(st.session_state["auto_sections"]),
         key="auto_sections",
     )
-    structure_mode = "auto" if auto_sections else "none"
+    structure_mode = "auto" if bool(st.session_state["auto_sections"]) else "none"
 
     st.markdown("**Backing tracks**")
-    make_bass = st.toggle("Bass (rules)", value=bool(st.session_state["make_bass"]), key="make_bass")
-    make_pad = st.toggle("Pad", value=bool(st.session_state["make_pad"]), key="make_pad")
-    make_drums = st.toggle("Drums", value=bool(st.session_state["make_drums"]), key="make_drums")
+    st.toggle("Bass (rules)", value=bool(st.session_state["make_bass"]), key="make_bass")
+    st.toggle("Pad", value=bool(st.session_state["make_pad"]), key="make_pad")
+    st.toggle("Drums", value=bool(st.session_state["make_drums"]), key="make_drums")
 
     with st.expander("Advanced controls", expanded=False):
         st.markdown("**Harmony (chords)**")
@@ -357,7 +387,7 @@ with left:
         st.selectbox(
             "Drums generator",
             ["rules", "ml"],
-            index=["rules", "ml"].index(st.session_state["drums_mode"]) if st.session_state["drums_mode"] in ["rules", "ml"] else 0,
+            index=["rules", "ml"].index(st.session_state["drums_mode"]) if st.session_state["drums_mode"] in ["rules", "ml"] else 1,
             key="drums_mode",
         )
         st.slider(
@@ -369,6 +399,41 @@ with left:
             key="ml_temp",
             disabled=(st.session_state["drums_mode"] != "ml"),
         )
+
+        # NEW: instrument programs
+        st.divider()
+        st.markdown("**Instruments (MIDI / General MIDI programs)**")
+        st.caption("This changes the instrument program in the output MIDI. The exact sound depends on your MIDI synth/DAW.")
+
+        # Pad selection
+        pad_idx = _preset_index(PAD_PRESETS, int(st.session_state["pad_program"]))
+        pad_preset = st.selectbox(
+            "Chords instrument (Pad track)",
+            PAD_PRESETS,
+            index=pad_idx,
+            format_func=lambda x: f"{x[0]} ({x[1]})",
+            key="pad_preset",
+        )
+        st.toggle("Custom pad program # (0-127)", value=bool(st.session_state["pad_custom_on"]), key="pad_custom_on")
+        if st.session_state["pad_custom_on"]:
+            st.number_input("Pad program", 0, 127, int(st.session_state["pad_program"]), key="pad_program")
+        else:
+            st.session_state["pad_program"] = int(pad_preset[1])
+
+        # Bass selection
+        bass_idx = _preset_index(BASS_PRESETS, int(st.session_state["bass_program"]))
+        bass_preset = st.selectbox(
+            "Bass instrument (Bass track)",
+            BASS_PRESETS,
+            index=bass_idx,
+            format_func=lambda x: f"{x[0]} ({x[1]})",
+            key="bass_preset",
+        )
+        st.toggle("Custom bass program # (0-127)", value=bool(st.session_state["bass_custom_on"]), key="bass_custom_on")
+        if st.session_state["bass_custom_on"]:
+            st.number_input("Bass program", 0, 127, int(st.session_state["bass_program"]), key="bass_program")
+        else:
+            st.session_state["bass_program"] = int(bass_preset[1])
 
         st.divider()
         st.markdown("**Humanize**")
@@ -423,6 +488,8 @@ def run_pipeline(
     jitter_ms: float,
     vel_jitter: int,
     swing: float,
+    pad_program: int,
+    bass_program: int,
 ) -> tuple[Path, dict]:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mid") as f:
         f.write(midi_bytes)
@@ -490,7 +557,7 @@ def run_pipeline(
             bars_per_chord=bars_per_chord,
         )
 
-    # Arrange (rules bass only)
+    # Arrange
     arrangement = arrange_backing(
         chords=chords,
         grid=grid,
@@ -513,9 +580,13 @@ def run_pipeline(
         )
 
     out_path = Path(tempfile.mkstemp(suffix=".mid")[1])
-    render_cfg = RenderConfig(melody_program=int(melody_source_insts[0].program))
 
-    # Render lead from original instruments + backing tracks
+    render_cfg = RenderConfig(
+        melody_program=int(melody_source_insts[0].program),
+        bass_program=int(bass_program),
+        pad_program=int(pad_program),
+    )
+
     write_midi(
         out_path,
         [],
@@ -537,14 +608,8 @@ def run_pipeline(
         "key": key,
         "mood": mood,
         "harmony_mode": harmony_mode,
-        "chord_model_path": str(chord_model_path),
-        "chord_step_beats": float(chord_step_beats),
-        "chord_stochastic": bool(chord_stochastic),
-        "chord_temperature": float(chord_temp),
-        "chord_top_k": int(chord_top_k),
-        "chord_repeat_penalty": float(chord_repeat_penalty),
-        "chord_change_penalty": float(chord_change_penalty),
-        "bass_mode": "rules",
+        "pad_program": int(pad_program),
+        "bass_program": int(bass_program),
         "chords": chords,
         "arrangement_counts": {k: len(v) for k, v in arrangement.tracks.items()},
         "instrument_list": [
@@ -611,7 +676,6 @@ if uploaded is not None:
 
 
 if generate_btn and uploaded is not None:
-    # Pull values from session_state (single source of truth)
     seed: Optional[int] = int(st.session_state["seed_value"]) if bool(st.session_state["use_seed"]) else None
     structure_mode = "auto" if bool(st.session_state["auto_sections"]) else "none"
 
@@ -647,6 +711,8 @@ if generate_btn and uploaded is not None:
                     jitter_ms=float(st.session_state["jitter_ms"]),
                     vel_jitter=int(st.session_state["vel_jitter"]),
                     swing=float(st.session_state["swing"]),
+                    pad_program=int(st.session_state["pad_program"]),
+                    bass_program=int(st.session_state["bass_program"]),
                 )
         except Exception as e:
             st.error(f"Generation failed: {e}")
@@ -662,6 +728,8 @@ if generate_btn and uploaded is not None:
         colA.metric("Tempo (BPM)", f"{info.tempo_bpm:.1f}")
         colB.metric("Time Signature", f"{info.time_signature.numerator}/{info.time_signature.denominator}")
         colC.metric("Duration (s)", f"{info.duration:.1f}")
+
+        st.markdown(f"**Pad program:** `{meta['pad_program']}`  ·  **Bass program:** `{meta['bass_program']}`")
 
         if meta["selected_melody_indices"]:
             st.markdown(f"**Melody tracks (manual):** {meta['selected_melody_indices']}")
@@ -688,8 +756,6 @@ if generate_btn and uploaded is not None:
         preview = " · ".join(chord_label(c.root_pc, c.quality, c.extensions) for c in chords[:8])
         st.markdown("**Chord progression preview:**")
         st.code(preview if preview else "(none)")
-
-        st.markdown("**Bass:** `rules`")
 
         midi_out_bytes = out_path.read_bytes()
         st.download_button(

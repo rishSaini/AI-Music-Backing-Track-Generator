@@ -597,6 +597,9 @@ def generate(
     structure: str = typer.Option("none", "--structure", help="Song structure: none | auto"),
     drums_mode: str = typer.Option("rules", "--drums-mode", help="Drums: rules | ml"),
     ml_temp: float = typer.Option(1.05, "--ml-temp", help="ML drum temperature (if drums_mode=ml)"),
+    # NEW: instrument programs
+    pad_program: int = typer.Option(4, "--pad-program", help="GM program (0-127) for the Pad/Chords track"),
+    bass_program: int = typer.Option(33, "--bass-program", help="GM program (0-127) for the Bass track"),
 ):
     requested = _parse_indices(melody_tracks)
     first_idx = requested[0] if requested else None
@@ -710,7 +713,6 @@ def generate(
 
     # ML bass override (before humanize)
     if (not no_bass) and bass_mode == "ml":
-        from .types import Note, BarGrid  # for type resolution
         bass_notes = generate_bass_ml(
             model_path=str(bass_model),
             melody_notes=melody_notes,
@@ -739,7 +741,11 @@ def generate(
     counts = {k: len(v) for k, v in arrangement.tracks.items()}
     typer.echo(f"Backing note counts: {counts}")
 
-    render_cfg = RenderConfig(melody_program=int(melody_source_insts[0].program))
+    render_cfg = RenderConfig(
+        melody_program=int(melody_source_insts[0].program),
+        bass_program=int(bass_program),
+        pad_program=int(pad_program),
+    )
     write_midi(output_midi, [], arrangement, info, config=render_cfg, melody_source_insts=melody_source_insts)
     typer.echo(f"Wrote: {output_midi.resolve()}")
 
