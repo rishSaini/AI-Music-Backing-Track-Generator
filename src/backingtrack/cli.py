@@ -600,6 +600,20 @@ def generate(
     # NEW: instrument programs
     pad_program: int = typer.Option(4, "--pad-program", help="GM program (0-127) for the Pad/Chords track"),
     bass_program: int = typer.Option(33, "--bass-program", help="GM program (0-127) for the Bass track"),
+    melody_volume: float = typer.Option(
+    1.0,
+    "--melody-volume",
+    min=0.0,
+    max=3.0,
+    help="Volume/gain for the copied melody instruments (velocity scale). 1.0 = unchanged.",
+    ),
+    backing_volume: float = typer.Option(
+    1.0,
+    "--backing-volume",
+    min=0.0,
+    max=3.0,
+    help="Volume/gain for backing tracks (bass/pad/drums) (velocity scale). 1.0 = unchanged.",
+),
 ):
     requested = _parse_indices(melody_tracks)
     first_idx = requested[0] if requested else None
@@ -767,6 +781,8 @@ def generate(
         melody_program=int(melody_source_insts[0].program),
         bass_program=int(bass_program),
         pad_program=int(pad_program),
+        melody_vel_scale=float(melody_volume),
+        backing_vel_scale=float(backing_volume),
     )
     write_midi(output_midi, [], arrangement, info, config=render_cfg, melody_source_insts=melody_source_insts)
     typer.echo(f"Wrote: {output_midi.resolve()}")

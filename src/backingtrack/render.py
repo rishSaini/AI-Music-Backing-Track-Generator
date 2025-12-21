@@ -12,13 +12,11 @@ from .arrange import Arrangement, TrackName
 from .types import MidiInfo, Note, TimeSignature
 
 # Reasonable GM programs (0-127). These are General MIDI instrument programs:
-# 0 = Acoustic Grand Piano, 33 = Electric Bass (finger), 4 = Electric Piano 1
+# 0 = Acoustic Grand Piano, 33 = Electric Bass (finger), 48 = Strings Ensemble 1
 DEFAULT_PROGRAMS: Dict[str, int] = {
     "melody": 0,
     "bass": 33,
-    # Changed default pad from Strings(48) to Electric Piano 1(4) to reduce "synth pad" feel
-    # (Still fully user-configurable via RenderConfig.pad_program)
-    "pad": 4,
+    "pad": 48,
 }
 
 DEFAULT_NAMES: Dict[str, str] = {
@@ -42,8 +40,12 @@ class RenderConfig:
     override_tempo_bpm: Optional[float] = None
 
     # ----------------------------
-    # Backing mix controls (NEW)
+    # Mix controls
     # ----------------------------
+    # Melody gain (applies to copied melody_source_insts OR rendered melody_notes)
+    melody_vel_scale: float = 1.00
+
+    # Backing mix controls
     auto_balance_backing: bool = True          # boost backing relative to melody if melody is very loud
     backing_target_ratio: float = 0.90         # aim backing median ~= 0.90 * melody median
     max_backing_boost: float = 1.80            # clamp auto boost so backing doesn't slam to 127
@@ -54,8 +56,24 @@ class RenderConfig:
     drums_vel_scale: float = 1.10
 
 
+def _clamp_vel(v: float) -> int:
+    return int(max(1, min(127, round(v))))
+
+
+def _scale_pretty_midi_instrument_velocities(inst: pretty_midi.Instrument, scale: float) -> None:
+    """
+    Scale note velocities in-place for a pretty_midi.Instrument.
+    This is the most DAW/player-compatible “volume control” for MIDI output.
+    """
+    s = float(scale)
+    if abs(s - 1.0) < 1e-9:
+        return
+    for n in inst.notes:
+        n.velocity = _clamp_vel(int(n.velocity) * s)
+
+
 def _to_pretty_midi_note(n: Note, vel_scale: float = 1.0) -> pretty_midi.Note:
-    v = int(max(1, min(127, round(int(n.velocity) * vel_scale))))
+    v = _clamp_vel(int(n.velocity) * float(vel_scale))
     return pretty_midi.Note(
         velocity=v,
         pitch=int(n.pitch),
@@ -79,7 +97,7 @@ def _notes_to_instrument(
 
 
 # ----------------------------
-# Velocity stats helpers (NEW)
+# Velocity stats helpers
 # ----------------------------
 def _median_int(xs: Sequence[int], default: int = 100) -> int:
     if not xs:
@@ -123,6 +141,9 @@ def build_pretty_midi(
             lead.is_drum = False
             lead.name = DEFAULT_NAMES["melody"] if len(melody_source_insts) == 1 else f"Melody {j + 1}"
 
+            # Apply melody volume control (NEW)
+            _scale_pretty_midi_instrument_velocities(lead, float(config.melody_vel_scale))
+
             # Make event ordering deterministic + player-safe
             lead.notes.sort(key=lambda x: (x.start, x.pitch))
             lead.control_changes.sort(key=lambda cc: cc.time)
@@ -137,6 +158,7 @@ def build_pretty_midi(
                 program=config.melody_program,
                 name=DEFAULT_NAMES["melody"],
                 is_drum=False,
+                vel_scale=float(config.melody_vel_scale),  # (NEW)
             )
         )
 
@@ -147,7 +169,7 @@ def build_pretty_midi(
     drum_notes = tracks.get("drums", [])
 
     # ----------------------------
-    # Auto-balance backing vs melody (NEW)
+    # Auto-balance backing vs melody
     # ----------------------------
     backing_notes: list[Note] = []
     backing_notes += list(bass_notes)
@@ -171,7 +193,7 @@ def build_pretty_midi(
     pad_scale = auto_boost * float(config.backing_vel_scale) * float(config.pad_vel_scale)
     drums_scale = auto_boost * float(config.backing_vel_scale) * float(config.drums_vel_scale)
 
-    # Backing tracks (now with vel_scale applied)
+    # Backing tracks (with vel_scale applied)
     if bass_notes:
         pm.instruments.append(
             _notes_to_instrument(

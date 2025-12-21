@@ -675,6 +675,8 @@ def run_pipeline(
         melody_program=int(melody_source_insts[0].program),
         bass_program=int(bass_program),
         pad_program=int(pad_program),
+        melody_vel_scale=float(melody_volume),
+        backing_vel_scale=float(backing_volume),
     )
 
     # Render lead from original instruments + backing tracks
@@ -771,6 +773,9 @@ if uploaded is not None:
                     for i, inst in enumerate(pm_preview.instruments)
                 ]
             )
+
+        melody_volume = st.slider("Melody volume", 0.0, 2.0, 1.0, 0.05)
+        backing_volume = st.slider("Backing volume", 0.0, 2.0, 1.0, 0.05)
 
         st.markdown("</div>", unsafe_allow_html=True)
 
