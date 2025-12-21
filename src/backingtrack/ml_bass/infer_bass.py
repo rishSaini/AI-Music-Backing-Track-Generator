@@ -27,11 +27,9 @@ def _load_chord_predictor():
     """
     try:
         from backingtrack.ml_harmony.steps_infer import predict_chords_steps as fn  # type: ignore
-
         return fn, "backingtrack.ml_harmony.steps_infer.predict_chords_steps"
     except Exception:
         from backingtrack.ml_harmony.infer import predict_chords_ml as fn  # type: ignore
-
         return fn, "backingtrack.ml_harmony.infer.predict_chords_ml"
 
 
@@ -47,7 +45,7 @@ def _call_chord_predictor(
 ) -> List[Any]:
     """
     Calls chord predictor using only supported kwargs.
-    Fixes errors like: unexpected keyword argument 'step_beats'
+    Avoids errors like: unexpected keyword argument 'step_beats'
     """
     sig = inspect.signature(fn)
     kwargs: Dict[str, Any] = {}
@@ -61,7 +59,6 @@ def _call_chord_predictor(
     elif "duration" in sig.parameters:
         kwargs["duration"] = float(duration_seconds)
 
-    # model path naming differences
     if "model_path" in sig.parameters:
         kwargs["model_path"] = model_path
     elif "model" in sig.parameters:
@@ -82,9 +79,6 @@ def _call_chord_predictor(
 # -----------------------------
 # Bass model (must match train_bass.py)
 # -----------------------------
-IGNORE_INDEX = -100
-
-
 @dataclass(frozen=True)
 class BassModelConfig:
     feat_dim: int
@@ -98,20 +92,14 @@ class BassModelConfig:
     n_layers: int = 4
     dropout: float = 0.1
 
+
 def _normalize_bass_cfg(cfg_in: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Makes older/newer cfg dictionaries compatible with inference code.
-
-    Handles:
-      - n_degrees -> n_degree
-      - n_registers -> n_register
-      - n_rhythms -> n_rhythm
-      - max_len/seq_len -> max_steps
-    Also filters out any unknown keys.
+    Makes cfg dictionaries compatible across versions and filters unknown keys.
     """
     cfg = dict(cfg_in)
 
-    # Aliases (either direction)
+    # aliases
     if "n_degrees" in cfg and "n_degree" not in cfg:
         cfg["n_degree"] = cfg.pop("n_degrees")
     if "n_registers" in cfg and "n_register" not in cfg:
@@ -125,8 +113,7 @@ def _normalize_bass_cfg(cfg_in: Dict[str, Any]) -> Dict[str, Any]:
         cfg["max_steps"] = cfg.pop("seq_len")
 
     allowed = {f.name for f in fields(BassModelConfig)}
-    cfg = {k: v for k, v in cfg.items() if k in allowed}
-    return cfg
+    return {k: v for k, v in cfg.items() if k in allowed}
 
 
 class BassTransformer(nn.Module):
@@ -190,31 +177,7 @@ class BassTransformer(nn.Module):
         return deg, reg, rhy
 
 
-def _normalize_bass_cfg(cfg_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Make older/newer cfg dicts compatible.
-    Accepts n_degree/n_degrees, etc.
-    """
-    cfg = dict(cfg_dict)
-
-    # common renames (just in case)
-    if "n_degrees" in cfg and "n_degree" not in cfg:
-        cfg["n_degree"] = cfg.pop("n_degrees")
-    if "n_registers" in cfg and "n_register" not in cfg:
-        cfg["n_register"] = cfg.pop("n_registers")
-    if "n_rhythms" in cfg and "n_rhythm" not in cfg:
-        cfg["n_rhythm"] = cfg.pop("n_rhythms")
-
-    # sometimes called max_len/seq_len
-    if "max_len" in cfg and "max_steps" not in cfg:
-        cfg["max_steps"] = cfg.pop("max_len")
-    if "seq_len" in cfg and "max_steps" not in cfg:
-        cfg["max_steps"] = cfg.pop("seq_len")
-
-    return cfg
-
-
-def load_bass_model(path: str | Path, device: Optional[str] = None) -> Tuple[BassTransformer, BassModelConfig, torch.device, Dict[str, Any]]:
+def load_bass_model(path: str | Path, device: Optional[str] = None) -> Tuple[BassTransformer, BassModelConfig, torch.device]:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Bass model not found: {p}")
@@ -222,27 +185,21 @@ def load_bass_model(path: str | Path, device: Optional[str] = None) -> Tuple[Bas
     dev = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(str(p), map_location=dev)
 
-    ckpt = torch.load(str(p), map_location=dev)
-    cfg_dict = _normalize_bass_cfg(ckpt["cfg"])
+    cfg_dict = _normalize_bass_cfg(dict(ckpt["cfg"]))
     cfg = BassModelConfig(**cfg_dict)
 
     model = BassTransformer(cfg).to(dev)
     model.load_state_dict(ckpt["state"])
     model.eval()
 
-    meta = ckpt.get("meta", {})
-    return model, cfg, dev, meta
+    return model, cfg, dev
 
 
 # -----------------------------
-# Features must match preprocess_bass.py
+# Features (must match preprocess_bass.py)
 # -----------------------------
 QUAL_VOCAB = ["N", "maj", "min", "7", "maj7", "min7", "dim", "sus2", "sus4"]
 QUAL_TO_I: Dict[str, int] = {q: i for i, q in enumerate(QUAL_VOCAB)}
-
-# degree labels (from preprocess_bass.py)
-DEG_VOCAB = ["REST", "ROOT", "THIRD", "FIFTH", "SEVENTH", "CHORD_TONE", "NONCHORD"]
-RHY_VOCAB = ["REST", "SUSTAIN", "HIT_ON", "HIT_OFF", "MULTI"]
 
 
 def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
@@ -293,10 +250,8 @@ def _normalize_quality(q: str) -> str:
     q = (q or "").strip().lower()
     if q in ("n", "none", "no_chord", "nochord"):
         return "N"
-    # keep within our vocab
     if q in QUAL_TO_I:
         return q
-    # map some common variants
     if q in ("major",):
         return "maj"
     if q in ("minor", "m"):
@@ -313,7 +268,6 @@ def _normalize_quality(q: str) -> str:
         return "sus4"
     if "dim" in q:
         return "dim"
-    # fallback
     return "maj"
 
 
@@ -324,12 +278,13 @@ def chord_step_features(ch: ChordEventLite) -> np.ndarray:
 
     qual_oh = np.zeros(len(QUAL_VOCAB), dtype=np.float32)
     q = _normalize_quality(ch.quality)
-    qual_oh[QUAL_TO_I.get(q, 0)] = 1.0  # default to "N"
+    qual_oh[QUAL_TO_I.get(q, 0)] = 1.0
 
     return np.concatenate([root_oh, qual_oh], axis=0).astype(np.float32)
 
 
 def step_in_bar_onehot(t0: float, spb: float, step_beats: float) -> np.ndarray:
+    # If step_beats >= 2 -> 2 bins (downbeat / offbeat-ish)
     bins = 2 if step_beats >= 2.0 else 4
     oh = np.zeros(bins, dtype=np.float32)
     beats = (t0 / max(1e-9, spb)) % 4.0
@@ -354,7 +309,7 @@ def get_chords_from_ml(
     include_key: bool,
     step_beats: float,
 ) -> List[ChordEventLite]:
-    fn, src = _load_chord_predictor()
+    fn, _src = _load_chord_predictor()
     evs = _call_chord_predictor(
         fn,
         melody_notes=melody_notes,
@@ -385,7 +340,7 @@ def get_chords_from_ml(
 
 
 # -----------------------------
-# Render bass from predictions (degree/register/rhythm)
+# Constrained decoding helpers
 # -----------------------------
 def chord_pitch_classes(root_pc: Optional[int], quality: str) -> Tuple[int, ...]:
     if root_pc is None or quality == "N":
@@ -421,7 +376,7 @@ def chord_pitch_classes(root_pc: Optional[int], quality: str) -> Tuple[int, ...]
 
 
 def pc_to_pitch(pc: int, register_bin: int) -> int:
-    centers = [40, 50, 60]  # low/mid/high centers
+    centers = [40, 50, 60]  # low/mid/high
     center = centers[int(np.clip(register_bin, 0, 2))]
     best = None
     best_dist = 1e9
@@ -435,7 +390,132 @@ def pc_to_pitch(pc: int, register_bin: int) -> int:
     return int(best if best is not None else center)
 
 
+def _closest_pitch_with_pc_in_range(pc: int, target: int, lo: int, hi: int) -> Optional[int]:
+    """
+    Among pitches in [lo,hi] with pitch%12 == pc, pick closest to target.
+    """
+    best = None
+    best_dist = 1e9
+    for pitch in range(lo, hi + 1):
+        if pitch % 12 != (pc % 12):
+            continue
+        d = abs(pitch - target)
+        if d < best_dist:
+            best_dist = d
+            best = pitch
+    return best
+
+
+def _snap_to_chord_tone(pitch: int, chord_pcs: Tuple[int, ...], lo: int, hi: int) -> int:
+    if not chord_pcs:
+        return pitch
+    if (pitch % 12) in chord_pcs and lo <= pitch <= hi:
+        return pitch
+
+    # choose nearest chord-tone pitch in range
+    best = None
+    best_dist = 1e9
+    for pc in chord_pcs:
+        cand = _closest_pitch_with_pc_in_range(int(pc), pitch, lo, hi)
+        if cand is None:
+            continue
+        d = abs(cand - pitch)
+        if d < best_dist:
+            best_dist = d
+            best = cand
+
+    return int(best if best is not None else pitch)
+
+
+def _clamp_register(pitch: int, lo: int, hi: int) -> int:
+    """
+    Pull pitch into [lo,hi] using octave shifts; if still out, hard clamp.
+    """
+    p = int(pitch)
+    while p < lo:
+        p += 12
+    while p > hi:
+        p -= 12
+    if p < lo:
+        p = lo
+    if p > hi:
+        p = hi
+    return p
+
+
+def _limit_jump(
+    pitch: int,
+    last_pitch: Optional[int],
+    chord_pcs: Tuple[int, ...],
+    lo: int,
+    hi: int,
+    max_leap: int,
+    allow_big_leap: bool,
+) -> int:
+    if last_pitch is None or allow_big_leap or max_leap <= 0:
+        return pitch
+
+    p = int(pitch)
+    if abs(p - last_pitch) <= max_leap:
+        return p
+
+    # Consider octave-shifted candidates + snap to chord tones, pick smallest leap.
+    candidates: List[int] = []
+    for k in (-24, -12, 0, 12, 24):
+        cand = p + k
+        cand = _clamp_register(cand, lo, hi)
+        cand = _snap_to_chord_tone(cand, chord_pcs, lo, hi)
+        candidates.append(int(cand))
+
+    # also consider directly picking closest chord-tone to last_pitch
+    if chord_pcs:
+        best_to_last = None
+        best_dist = 1e9
+        for pc in chord_pcs:
+            cand = _closest_pitch_with_pc_in_range(int(pc), last_pitch, lo, hi)
+            if cand is None:
+                continue
+            d = abs(int(cand) - int(last_pitch))
+            if d < best_dist:
+                best_dist = d
+                best_to_last = int(cand)
+        if best_to_last is not None:
+            candidates.append(best_to_last)
+
+    best = min(candidates, key=lambda x: abs(x - last_pitch)) if candidates else p
+    return int(best)
+
+
+def is_phrase_boundary(
+    *,
+    step_idx: int,
+    t0: float,
+    grid: BarGrid,
+    step_len: float,
+    chord_now: ChordEventLite,
+    chord_prev: Optional[ChordEventLite],
+) -> bool:
+    # bar start
+    spb = float(grid.seconds_per_beat)
+    beats = (t0 / max(1e-9, spb)) % 4.0
+    bar_start = beats < 1e-6
+
+    # chord change
+    chord_change = False
+    if chord_prev is not None:
+        chord_change = (chord_prev.root_pc != chord_now.root_pc) or (chord_prev.quality != chord_now.quality)
+
+    # periodic phrase boundary (every 8 steps) as a fallback
+    periodic = (step_idx % 8) == 0
+
+    return bool(bar_start or chord_change or periodic)
+
+
+# -----------------------------
+# Render bass from predictions (with constraints)
+# -----------------------------
 def render_bass_step(
+    *,
     t0: float,
     step_len: float,
     degree_id: int,
@@ -443,19 +523,30 @@ def render_bass_step(
     rhythm_id: int,
     chord: ChordEventLite,
     velocity: int,
-) -> List[Note]:
-    # degree_id uses DEG_VOCAB indexing:
-    # 0 REST, 1 ROOT, 2 THIRD, 3 FIFTH, 4 SEVENTH, 5 CHORD_TONE, 6 NONCHORD
+    last_pitch: Optional[int],
+    apply_constraints: bool,
+    min_pitch: int,
+    max_pitch: int,
+    max_leap: int,
+    allow_big_leap: bool,
+) -> Tuple[List[Note], Optional[int]]:
+    """
+    Returns (notes, new_last_pitch).
+    """
+    # rhythm mapping:
+    # 0 REST, 1 SUSTAIN, 2 HIT_ON, 3 HIT_OFF, 4 MULTI
     if rhythm_id == 0 or degree_id == 0:
-        return []
+        return [], last_pitch
 
     if chord.root_pc is None or _normalize_quality(chord.quality) == "N":
-        return []
+        return [], last_pitch
 
     root = int(chord.root_pc) % 12
     pcs = chord_pitch_classes(root, chord.quality)
+    if not pcs:
+        return [], last_pitch
 
-    # pick a PC based on degree class
+    # pick a PC based on degree class (same as before)
     if degree_id == 1:  # ROOT
         pc = root
     elif degree_id == 2:  # THIRD
@@ -465,28 +556,40 @@ def render_bass_step(
     elif degree_id == 4:  # SEVENTH
         pc = pcs[3] if len(pcs) >= 4 else root
     elif degree_id == 5:  # CHORD_TONE
-        # prefer a non-root chord tone
         candidates = [p for p in pcs if p != root]
         pc = candidates[0] if candidates else root
     else:  # NONCHORD
         pc = (root + 1) % 12
 
-    pitch = pc_to_pitch(pc, register_id)
+    # initial pitch from register
+    pitch = pc_to_pitch(int(pc), int(register_id))
 
-    # rhythm_id uses RHY_VOCAB indexing:
-    # 0 REST, 1 SUSTAIN, 2 HIT_ON, 3 HIT_OFF, 4 MULTI
-    if rhythm_id == 1:  # SUSTAIN
-        return [Note(pitch=pitch, start=t0, end=t0 + step_len, velocity=velocity)]
-    if rhythm_id == 2:  # HIT_ON
-        return [Note(pitch=pitch, start=t0, end=t0 + step_len, velocity=velocity)]
-    if rhythm_id == 3:  # HIT_OFF
-        return [Note(pitch=pitch, start=t0 + 0.5 * step_len, end=t0 + step_len, velocity=velocity)]
-    if rhythm_id == 4:  # MULTI
-        return [
+    if apply_constraints:
+        pitch = _clamp_register(pitch, min_pitch, max_pitch)
+        pitch = _snap_to_chord_tone(pitch, pcs, min_pitch, max_pitch)
+        pitch = _limit_jump(
+            pitch=pitch,
+            last_pitch=last_pitch,
+            chord_pcs=pcs,
+            lo=min_pitch,
+            hi=max_pitch,
+            max_leap=max_leap,
+            allow_big_leap=allow_big_leap,
+        )
+
+    notes: List[Note] = []
+    if rhythm_id in (1, 2):  # SUSTAIN / HIT_ON
+        notes = [Note(pitch=pitch, start=t0, end=t0 + step_len, velocity=velocity)]
+    elif rhythm_id == 3:  # HIT_OFF
+        notes = [Note(pitch=pitch, start=t0 + 0.5 * step_len, end=t0 + step_len, velocity=velocity)]
+    elif rhythm_id == 4:  # MULTI
+        notes = [
             Note(pitch=pitch, start=t0, end=t0 + 0.5 * step_len, velocity=velocity),
             Note(pitch=pitch, start=t0 + 0.5 * step_len, end=t0 + step_len, velocity=velocity),
         ]
-    return []
+
+    new_last = pitch if notes else last_pitch
+    return notes, new_last
 
 
 def sample_from_logits(logits: np.ndarray, temperature: float = 0.0, top_k: int = 0) -> int:
@@ -522,6 +625,13 @@ def main() -> None:
     ap.add_argument("--temperature", type=float, default=0.0, help="0=greedy")
     ap.add_argument("--top_k", type=int, default=0)
     ap.add_argument("--velocity", type=int, default=90)
+
+    # NEW: decoding constraints
+    ap.add_argument("--no_constraints", action="store_true", help="Disable constrained decoding")
+    ap.add_argument("--min_pitch", type=int, default=36, help="Register clamp low bound (MIDI)")
+    ap.add_argument("--max_pitch", type=int, default=60, help="Register clamp high bound (MIDI)")
+    ap.add_argument("--max_leap", type=int, default=7, help="Max allowed leap in semitones (non-boundary steps)")
+
     args = ap.parse_args()
 
     pm, info, grid, melody_inst, _sel = load_and_prepare(args.midi)
@@ -529,7 +639,6 @@ def main() -> None:
     if not melody_notes:
         raise RuntimeError("No melody notes extracted from MIDI.")
 
-    # Chords from ML (step-based if available, else bar-based)
     chords = get_chords_from_ml(
         melody_notes=melody_notes,
         grid=grid,
@@ -539,7 +648,7 @@ def main() -> None:
         step_beats=float(args.step_beats),
     )
 
-    # Build bass conditioning features (MATCH preprocess_bass.py ORDER)
+    # Build conditioning features (must match preprocess)
     step_len = float(args.step_beats) * float(grid.seconds_per_beat)
     step_len = max(1e-6, step_len)
     n_steps = int(np.ceil(max(1e-6, float(info.duration)) / step_len))
@@ -564,7 +673,7 @@ def main() -> None:
     X = np.stack(feats, axis=0).astype(np.float32)  # (T,F)
 
     # Load bass model
-    model, cfg, dev, meta = load_bass_model(args.bass_model)
+    model, cfg, dev = load_bass_model(args.bass_model)
 
     if X.shape[1] != int(cfg.feat_dim):
         raise ValueError(
@@ -573,11 +682,18 @@ def main() -> None:
             f"Try rerun with/without --include_key to match training."
         )
 
-    # Run in chunks of cfg.max_steps (pos embedding length)
+    # Run in chunks of cfg.max_steps
     T = X.shape[0]
     max_steps = int(cfg.max_steps)
 
     bass_notes: List[Note] = []
+    last_pitch: Optional[int] = None
+    prev_chord: Optional[ChordEventLite] = None
+
+    apply_constraints = (not bool(args.no_constraints))
+    min_pitch = int(args.min_pitch)
+    max_pitch = int(args.max_pitch)
+    max_leap = int(args.max_leap)
 
     start = 0
     while start < T:
@@ -606,7 +722,15 @@ def main() -> None:
             if t0 >= float(info.duration):
                 break
 
-            ch = chord_at(chords, t0 + 1e-4)
+            chord_now = chord_at(chords, t0 + 1e-4)
+            allow_big = is_phrase_boundary(
+                step_idx=step_idx,
+                t0=float(t0),
+                grid=grid,
+                step_len=float(step_len),
+                chord_now=chord_now,
+                chord_prev=prev_chord,
+            )
 
             if args.temperature > 0:
                 deg = sample_from_logits(deg_logits[j], temperature=float(args.temperature), top_k=int(args.top_k))
@@ -617,15 +741,23 @@ def main() -> None:
 
             reg = int(np.argmax(reg_logits[j]))
 
-            bass_notes.extend(render_bass_step(
-                t0=t0,
-                step_len=step_len,
-                degree_id=deg,
-                register_id=reg,
-                rhythm_id=rhy,
-                chord=ch,
+            step_notes, last_pitch = render_bass_step(
+                t0=float(t0),
+                step_len=float(step_len),
+                degree_id=int(deg),
+                register_id=int(reg),
+                rhythm_id=int(rhy),
+                chord=chord_now,
                 velocity=int(args.velocity),
-            ))
+                last_pitch=last_pitch,
+                apply_constraints=apply_constraints,
+                min_pitch=min_pitch,
+                max_pitch=max_pitch,
+                max_leap=max_leap,
+                allow_big_leap=allow_big,
+            )
+            bass_notes.extend(step_notes)
+            prev_chord = chord_now
 
         start = end
 
@@ -633,18 +765,20 @@ def main() -> None:
     out_pm = pretty_midi.PrettyMIDI(initial_tempo=float(info.tempo_bpm))
     bass_inst = pretty_midi.Instrument(program=33, name="Bass (ML)")  # GM finger bass
     for n in bass_notes:
-        bass_inst.notes.append(pretty_midi.Note(
-            velocity=int(n.velocity),
-            pitch=int(n.pitch),
-            start=float(n.start),
-            end=float(n.end),
-        ))
+        bass_inst.notes.append(
+            pretty_midi.Note(
+                velocity=int(n.velocity),
+                pitch=int(n.pitch),
+                start=float(n.start),
+                end=float(n.end),
+            )
+        )
     out_pm.instruments.append(bass_inst)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_pm.write(str(out_path))
-    print(f"Saved: {out_path} | notes={len(bass_notes)}")
+    print(f"Saved: {out_path} | notes={len(bass_notes)} | constraints={'ON' if apply_constraints else 'OFF'}")
 
 
 if __name__ == "__main__":
