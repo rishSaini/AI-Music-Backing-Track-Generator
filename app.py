@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -11,11 +14,11 @@ import streamlit as st
 
 from backingtrack.arrange import arrange_backing
 from backingtrack.harmony_baseline import generate_chords
-from backingtrack.ml_harmony.steps_infer import ChordSampleConfig, generate_chords_ml_steps
 from backingtrack.humanize import HumanizeConfig, humanize_arrangement
 from backingtrack.key_detect import estimate_key, key_to_string
 from backingtrack.melody import MelodyConfig, extract_melody_notes
 from backingtrack.midi_io import load_and_prepare
+from backingtrack.ml_harmony.steps_infer import ChordSampleConfig, generate_chords_ml_steps
 from backingtrack.moods import apply_mood_to_key, get_mood, list_moods
 from backingtrack.render import RenderConfig, write_midi
 
@@ -31,6 +34,94 @@ def chord_label(root_pc: int, quality: str, extensions: tuple[int, ...]) -> str:
     if 14 in extensions:
         name += "add9"
     return name
+
+
+# ----------------------------
+# Audio preview (Option B): MIDI -> WAV with FluidSynth
+# ----------------------------
+def _guess_soundfont_path() -> str:
+    """
+    Best-effort default SoundFont path for FluidSynth rendering.
+    Override via:
+      - UI (Advanced controls -> 🎧 Audio preview)
+      - env var: CHORDCRAFT_SOUNDFONT
+    """
+    env = os.environ.get("CHORDCRAFT_SOUNDFONT", "").strip()
+    if env:
+        return env
+
+    candidates = [
+        "soundfonts/GeneralUser_GS.sf2",
+        "data/soundfonts/GeneralUser_GS.sf2",
+        "assets/GeneralUser_GS.sf2",
+        "GeneralUser_GS.sf2",
+    ]
+    for c in candidates:
+        if Path(c).exists():
+            return str(Path(c))
+    return ""
+
+
+def _fluidsynth_cmd() -> Optional[str]:
+    # On Windows this may be fluidsynth.exe; shutil.which handles that.
+    return shutil.which("fluidsynth")
+
+
+def _render_midi_to_wav_bytes(midi_bytes: bytes, *, soundfont_path: str, sample_rate: int = 44100) -> bytes:
+    """
+    Render MIDI -> WAV using system `fluidsynth` + a .sf2 SoundFont.
+    Returns WAV bytes.
+    """
+    cmd = _fluidsynth_cmd()
+    if not cmd:
+        raise RuntimeError("FluidSynth not found on PATH. Install fluidsynth to enable audio preview.")
+
+    sf2 = Path(soundfont_path)
+    if not sf2.exists():
+        raise RuntimeError(f"SoundFont not found: {soundfont_path}")
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        mid_path = td / "preview.mid"
+        wav_path = td / "preview.wav"
+        mid_path.write_bytes(midi_bytes)
+
+        # -ni : no interactive shell
+        # -F  : output wav file
+        # -r  : sample rate
+        # -g  : gain (kept modest to avoid clipping)
+        try:
+            subprocess.run(
+                [cmd, "-ni", str(sf2), str(mid_path), "-F", str(wav_path), "-r", str(sample_rate), "-g", "0.8"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except subprocess.CalledProcessError as e:
+            err = (e.stderr or b"").decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(f"FluidSynth failed to render audio. {err}") from e
+
+        if not wav_path.exists():
+            raise RuntimeError("FluidSynth did not produce a WAV file.")
+        return wav_path.read_bytes()
+
+
+@st.cache_data(show_spinner=False)
+def render_midi_to_wav_cached(
+    midi_bytes: bytes,
+    soundfont_path: str,
+    soundfont_mtime: float,
+    sample_rate: int = 44100,
+) -> bytes:
+    """
+    Cached wrapper so re-renders are instant if MIDI + SoundFont haven't changed.
+    soundfont_mtime is included to invalidate cache if the .sf2 changes.
+    """
+    _ = soundfont_mtime  # part of the cache key
+    return _render_midi_to_wav_bytes(midi_bytes, soundfont_path=soundfont_path, sample_rate=sample_rate)
+
+
+DEFAULT_SOUNDFONT_PATH = _guess_soundfont_path()
 
 
 # ----------------------------
@@ -101,7 +192,9 @@ def _auto_pick_with_intro(
         sel = info_or_sel
 
     # Case B: called as (pm, info, sel) where 3rd arg is actually sel
-    elif sel is None and melody_inst is not None and hasattr(melody_inst, "instrument_index") and not hasattr(melody_inst, "notes"):
+    elif sel is None and melody_inst is not None and hasattr(melody_inst, "instrument_index") and not hasattr(
+        melody_inst, "notes"
+    ):
         info = info_or_sel
         sel = melody_inst
         melody_inst = None
@@ -113,10 +206,8 @@ def _auto_pick_with_intro(
     if sel is None:
         raise ValueError("_auto_pick_with_intro: could not determine `sel` (melody selection).")
 
-    # Base lead indices: multi-select if available, else fallback to single
     base_idxs = list(getattr(sel, "instrument_indices", None) or [int(getattr(sel, "instrument_index", 0))])
 
-    # Sanitize indices (in-range, not drums)
     valid_base: list[int] = []
     for i in base_idxs:
         i = int(i)
@@ -125,7 +216,6 @@ def _auto_pick_with_intro(
                 valid_base.append(i)
 
     if not valid_base:
-        # ultimate fallback: first non-drum with notes
         for i, inst in enumerate(pm.instruments):
             if (not inst.is_drum) and inst.notes:
                 valid_base = [i]
@@ -134,23 +224,22 @@ def _auto_pick_with_intro(
     if melody_inst is None:
         melody_inst = pm.instruments[valid_base[0]]
 
-    # Use info.duration if available, else end_time
     song_end = float(getattr(info, "duration", 0.0) or 0.0)
     if song_end <= 1e-6:
         song_end = float(pm.get_end_time())
 
-    # Median pitch of the combined base lead(s)
     all_base_pitches: list[int] = []
     for i in valid_base:
         all_base_pitches.extend([int(n.pitch) for n in pm.instruments[i].notes])
     if all_base_pitches:
         all_base_pitches.sort()
         m = len(all_base_pitches)
-        main_med = float(all_base_pitches[m // 2]) if (m % 2 == 1) else 0.5 * (all_base_pitches[m // 2 - 1] + all_base_pitches[m // 2])
+        main_med = float(all_base_pitches[m // 2]) if (m % 2 == 1) else 0.5 * (
+            all_base_pitches[m // 2 - 1] + all_base_pitches[m // 2]
+        )
     else:
         main_med = _median_pitch(melody_inst)
 
-    # Find short, high-pitch intro candidates (excluding *all* base leads)
     base_set = set(valid_base)
     intro_candidates: list[tuple[int, float, int]] = []  # (idx, median_pitch, note_count)
 
@@ -180,7 +269,6 @@ def _auto_pick_with_intro(
     intro_candidates.sort(key=lambda x: (-x[1], -x[2]))
     picked_intro_idxs = [idx for (idx, _, _) in intro_candidates[: max(0, int(max_intro))]]
 
-    # Used indices: intro first, then ALL base leads
     used_indices: list[int] = []
     for i in picked_intro_idxs + valid_base:
         if i not in used_indices:
@@ -189,8 +277,9 @@ def _auto_pick_with_intro(
     melody_source_insts = [pm.instruments[i] for i in used_indices]
     return melody_source_insts, picked_intro_idxs
 
+
 # ----------------------------
-# Auto settings (kept)
+# Auto settings
 # ----------------------------
 @st.cache_data(show_spinner=False)
 def recommend_settings(midi_bytes: bytes) -> Dict[str, Any]:
@@ -199,8 +288,6 @@ def recommend_settings(midi_bytes: bytes) -> Dict[str, Any]:
     Project preference:
       - Chords default to RULES
       - Drums default to ML
-
-    NOTE: We intentionally do NOT set pad/bass program here so user selection persists.
     """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mid") as f:
         f.write(midi_bytes)
@@ -252,10 +339,7 @@ def recommend_settings(midi_bytes: bytes) -> Dict[str, Any]:
         chord_change_penalty = 0.22
 
     drums_mode = "ml"
-    if fast or sparse:
-        ml_temp = 1.05
-    else:
-        ml_temp = 1.00
+    ml_temp = 1.05 if (fast or sparse) else 1.00
 
     quantize_melody = bool(dense and bpm >= 110.0)
 
@@ -297,29 +381,36 @@ def _apply_auto_settings(reco: Dict[str, Any], *, file_sig: str, force: bool = F
 # ----------------------------
 # UI
 # ----------------------------
-st.set_page_config(page_title="AI Backing Track Maker", layout="wide")
+st.set_page_config(page_title="ChordCraft", layout="centered")
 
 st.markdown(
     """
     <style>
-      .card { border: 1px solid rgba(255,255,255,0.08); border-radius: 14px;
-              padding: 16px 18px; background: rgba(255,255,255,0.04); }
+      .hero { text-align: center; margin-top: 0.25rem; margin-bottom: 1.25rem; }
+      .hero-title { font-size: 3.2rem; font-weight: 850; letter-spacing: 0.4px; line-height: 1.02; }
+      .hero-sub { opacity: 0.74; font-size: 1.02rem; margin-top: 0.45rem; }
       .muted { opacity: 0.75; }
       code { font-size: 0.95em; }
+      .sp { height: 10px; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("🎼 AI Backing Track Maker")
-st.caption("Upload a MIDI melody → generate a backing track (bass/pad/drums) → download a new multi-track MIDI.")
-
-left, right = st.columns([0.42, 0.58], gap="large")
+st.markdown(
+    """
+    <div class="hero">
+      <div class="hero-title">ChordCraft</div>
+      <div class="hero-sub">Upload a MIDI melody → generate bass/pad/drums → download a new multi-track MIDI.</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 DEFAULTS: Dict[str, Any] = {
     "mood_name": "neutral",
     "auto_settings": True,
-    "harmony_mode": "baseline (rules)",   # chords default = rules
+    "harmony_mode": "baseline (rules)",
     "bars_per_chord": 1,
     "chord_model_path": "data/ml/chord_model_new.pt",
     "chord_step_beats": 2.0,
@@ -330,7 +421,7 @@ DEFAULTS: Dict[str, Any] = {
     "chord_repeat_penalty": 1.2,
     "chord_change_penalty": 0.15,
     "quantize_melody": False,
-    "drums_mode": "ml",                  # drums default = ML
+    "drums_mode": "ml",
     "ml_temp": 1.00,
     "humanize": True,
     "jitter_ms": 15.0,
@@ -342,185 +433,22 @@ DEFAULTS: Dict[str, Any] = {
     "make_bass": True,
     "make_pad": True,
     "make_drums": True,
-    # NEW: instrument programs
-    "pad_program": 4,    # Electric Piano 1
-    "bass_program": 33,  # Electric Bass (finger)
+    "melody_volume": 1.0,
+    "backing_volume": 1.0,
+    "pad_program": 4,
+    "bass_program": 33,
     "pad_custom_on": False,
     "bass_custom_on": False,
+    "soundfont_path": DEFAULT_SOUNDFONT_PATH,
+    "auto_render_audio": True,
+    "_generated_midi_bytes": None,
+    "_generated_meta": None,
+    "_generated_audio_wav": None,
+    "_generated_audio_err": None,
+    "_generated_audio_sig": None,
 }
 for k, v in DEFAULTS.items():
     st.session_state.setdefault(k, v)
-
-with left:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("1) Upload MIDI")
-    uploaded = st.file_uploader("MIDI file (.mid / .midi)", type=["mid", "midi"])
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown('<div class="card" style="margin-top: 14px;">', unsafe_allow_html=True)
-    st.subheader("2) Controls")
-
-    moods = list_moods()
-    st.selectbox(
-        "Mood",
-        moods,
-        index=moods.index(st.session_state["mood_name"]) if st.session_state["mood_name"] in moods else 0,
-        key="mood_name",
-    )
-
-    st.toggle(
-        "Auto choose settings",
-        value=bool(st.session_state["auto_settings"]),
-        key="auto_settings",
-        help="Picks good defaults for this MIDI. You can override anything in Advanced controls.",
-    )
-
-    if uploaded is not None and st.session_state["auto_settings"]:
-        midi_bytes = uploaded.getvalue()
-        file_sig = hashlib.sha1(midi_bytes).hexdigest()
-        reco = recommend_settings(midi_bytes)
-
-        c1, c2 = st.columns([0.62, 0.38])
-        with c1:
-            st.caption(
-                f"Auto: chords={reco['harmony_mode']} · drums={reco['drums_mode']} · quantize={'on' if reco['quantize_melody'] else 'off'}"
-            )
-        with c2:
-            reapply = st.button("Re-apply auto", use_container_width=True)
-
-        _apply_auto_settings(reco, file_sig=file_sig, force=bool(reapply))
-
-    st.toggle(
-        "Auto song sections (intro/verse/chorus/outro)",
-        value=bool(st.session_state["auto_sections"]),
-        key="auto_sections",
-    )
-    structure_mode = "auto" if bool(st.session_state["auto_sections"]) else "none"
-
-    st.markdown("**Backing tracks**")
-    st.toggle("Bass (rules)", value=bool(st.session_state["make_bass"]), key="make_bass")
-    st.toggle("Pad", value=bool(st.session_state["make_pad"]), key="make_pad")
-    st.toggle("Drums", value=bool(st.session_state["make_drums"]), key="make_drums")
-
-    with st.expander("Advanced controls", expanded=False):
-        st.markdown("**Harmony (chords)**")
-        harmony_mode = st.selectbox(
-            "Chord generator",
-            ["baseline (rules)", "ml (transformer)"],
-            index=["baseline (rules)", "ml (transformer)"].index(st.session_state["harmony_mode"])
-            if st.session_state["harmony_mode"] in ["baseline (rules)", "ml (transformer)"]
-            else 0,
-            key="harmony_mode",
-        )
-
-        if str(harmony_mode).startswith("ml"):
-            st.text_input("Chord model path", value=str(st.session_state["chord_model_path"]), key="chord_model_path")
-            st.selectbox(
-                "Chord step size (beats)",
-                [1.0, 2.0, 4.0],
-                index=[1.0, 2.0, 4.0].index(float(st.session_state["chord_step_beats"]))
-                if float(st.session_state["chord_step_beats"]) in [1.0, 2.0, 4.0]
-                else 1,
-                key="chord_step_beats",
-            )
-            st.toggle("Include key features (recommended)", value=bool(st.session_state["chord_include_key"]), key="chord_include_key")
-            st.toggle("Stochastic chords (more variety)", value=bool(st.session_state["chord_stochastic"]), key="chord_stochastic")
-            st.slider("Chord temperature", 0.7, 1.6, float(st.session_state["chord_temp"]), 0.01, key="chord_temp")
-            st.slider("Chord top-k (0 = no top-k)", 0, 40, int(st.session_state["chord_top_k"]), 1, key="chord_top_k")
-            st.slider("Chord repeat penalty", 0.0, 3.0, float(st.session_state["chord_repeat_penalty"]), 0.05, key="chord_repeat_penalty")
-            st.slider(
-                "Chord smoothness (change penalty)",
-                0.0,
-                0.6,
-                float(st.session_state["chord_change_penalty"]),
-                0.01,
-                key="chord_change_penalty",
-                disabled=bool(st.session_state["chord_stochastic"]),
-            )
-            st.slider("Bars per chord (baseline only)", 1, 4, int(st.session_state["bars_per_chord"]), 1, key="bars_per_chord", disabled=True)
-        else:
-            st.slider("Bars per chord", 1, 4, int(st.session_state["bars_per_chord"]), 1, key="bars_per_chord")
-
-        st.markdown("**Melody preprocessing**")
-        st.toggle("Quantize melody to beat grid", value=bool(st.session_state["quantize_melody"]), key="quantize_melody")
-
-        st.divider()
-        st.markdown("**Drums**")
-        st.selectbox(
-            "Drums generator",
-            ["rules", "ml"],
-            index=["rules", "ml"].index(st.session_state["drums_mode"]) if st.session_state["drums_mode"] in ["rules", "ml"] else 1,
-            key="drums_mode",
-        )
-        st.slider(
-            "ML drum temperature",
-            0.8,
-            1.4,
-            float(st.session_state["ml_temp"]),
-            0.01,
-            key="ml_temp",
-            disabled=(st.session_state["drums_mode"] != "ml"),
-        )
-
-        # NEW: instrument programs
-        st.divider()
-        st.markdown("**Instruments (MIDI / General MIDI programs)**")
-        st.caption("This changes the instrument program in the output MIDI. The exact sound depends on your MIDI synth/DAW.")
-
-        # Pad selection
-        pad_idx = _preset_index(PAD_PRESETS, int(st.session_state["pad_program"]))
-        pad_preset = st.selectbox(
-            "Chords instrument (Pad track)",
-            PAD_PRESETS,
-            index=pad_idx,
-            format_func=lambda x: f"{x[0]} ({x[1]})",
-            key="pad_preset",
-        )
-        st.toggle("Custom pad program # (0-127)", value=bool(st.session_state["pad_custom_on"]), key="pad_custom_on")
-        if st.session_state["pad_custom_on"]:
-            st.number_input("Pad program", 0, 127, int(st.session_state["pad_program"]), key="pad_program")
-        else:
-            st.session_state["pad_program"] = int(pad_preset[1])
-
-        # Bass selection
-        bass_idx = _preset_index(BASS_PRESETS, int(st.session_state["bass_program"]))
-        bass_preset = st.selectbox(
-            "Bass instrument (Bass track)",
-            BASS_PRESETS,
-            index=bass_idx,
-            format_func=lambda x: f"{x[0]} ({x[1]})",
-            key="bass_preset",
-        )
-        st.toggle("Custom bass program # (0-127)", value=bool(st.session_state["bass_custom_on"]), key="bass_custom_on")
-        if st.session_state["bass_custom_on"]:
-            st.number_input("Bass program", 0, 127, int(st.session_state["bass_program"]), key="bass_program")
-        else:
-            st.session_state["bass_program"] = int(bass_preset[1])
-
-        st.divider()
-        st.markdown("**Humanize**")
-        st.toggle("Humanize timing/velocity", value=bool(st.session_state["humanize"]), key="humanize")
-        st.slider("Timing jitter (ms)", 0.0, 35.0, float(st.session_state["jitter_ms"]), 1.0, key="jitter_ms", disabled=not bool(st.session_state["humanize"]))
-        st.slider("Velocity jitter", 0, 20, int(st.session_state["vel_jitter"]), 1, key="vel_jitter", disabled=not bool(st.session_state["humanize"]))
-        st.slider("Swing (0..1)", 0.0, 0.6, float(st.session_state["swing"]), 0.01, key="swing", disabled=not bool(st.session_state["humanize"]))
-
-        st.divider()
-        st.markdown("**Seed**")
-        st.number_input("Seed value", value=int(st.session_state["seed_value"]), step=1, key="seed_value")
-        st.toggle("Use seed", value=bool(st.session_state["use_seed"]), key="use_seed")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    generate_btn = st.button("✨ Generate backing track", use_container_width=True, disabled=(uploaded is None))
-
-with right:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("Output")
-    st.markdown(
-        '<p class="muted">Once generated, you’ll see detected key, chosen melody track(s), chord progression preview, and a download button.</p>',
-        unsafe_allow_html=True,
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def run_pipeline(
@@ -552,19 +480,19 @@ def run_pipeline(
     swing: float,
     pad_program: int,
     bass_program: int,
+    melody_volume: float,
+    backing_volume: float,
 ) -> tuple[Path, dict]:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mid") as f:
         f.write(midi_bytes)
         in_path = Path(f.name)
 
-    # If the user manually picked tracks, we still let that override auto
     first_idx = melody_track_indices[0] if melody_track_indices else None
     pm, info, grid, melody_inst, sel = load_and_prepare(in_path, melody_instrument_index=first_idx)
 
     picked_intro_idxs: list[int] = []
     used_melody_indices: list[int] = []
 
-    # Decide which instruments are the "lead"
     if melody_track_indices:
         valid: list[int] = []
         for i in melody_track_indices:
@@ -575,7 +503,6 @@ def run_pipeline(
         melody_source_insts = [pm.instruments[i] for i in valid]
         used_melody_indices = valid
     else:
-        # NEW: use multi-lead selection from midi_io (fallback to single)
         base_idxs = getattr(sel, "instrument_indices", None)
         if not base_idxs:
             base_idxs = [getattr(sel, "instrument_index", 0)]
@@ -589,13 +516,11 @@ def run_pipeline(
             if 0 <= ii < len(pm.instruments) and not pm.instruments[ii].is_drum:
                 base_valid.append(ii)
 
-        # hard fallback if something is off
         if not base_valid:
             fb = int(getattr(sel, "instrument_index", 0))
             if 0 <= fb < len(pm.instruments) and not pm.instruments[fb].is_drum:
                 base_valid = [fb]
 
-        # Keep your intro heuristic, but don't let it "steal" one of the base leads
         _, picked_intro_idxs = _auto_pick_with_intro(pm, info, melody_inst, sel)
         picked_intro_idxs = [i for i in picked_intro_idxs if i not in base_valid]
 
@@ -606,7 +531,6 @@ def run_pipeline(
 
         melody_source_insts = [pm.instruments[i] for i in used_melody_indices]
 
-    # Combine selected lead instruments for analysis
     analysis_inst = pretty_midi.Instrument(program=int(melody_source_insts[0].program), is_drum=False, name="Analysis")
     analysis_inst.notes = [n for inst in melody_source_insts for n in inst.notes]
     analysis_inst.notes.sort(key=lambda n: (n.start, n.pitch))
@@ -619,7 +543,6 @@ def run_pipeline(
     raw_key = estimate_key(melody_notes)
     key = apply_mood_to_key(raw_key, mood)
 
-    # Chords
     if str(harmony_mode).startswith("ml"):
         chords = generate_chords_ml_steps(
             melody_notes=melody_notes,
@@ -647,7 +570,6 @@ def run_pipeline(
             bars_per_chord=bars_per_chord,
         )
 
-    # Arrange
     arrangement = arrange_backing(
         chords=chords,
         grid=grid,
@@ -679,7 +601,6 @@ def run_pipeline(
         backing_vel_scale=float(backing_volume),
     )
 
-    # Render lead from original instruments + backing tracks
     write_midi(
         out_path,
         [],
@@ -718,9 +639,78 @@ def run_pipeline(
         "pad_program": int(pad_program),
         "bass_program": int(bass_program),
         "melody_program": int(melody_source_insts[0].program) if melody_source_insts else None,
+        "melody_volume": float(melody_volume),
+        "backing_volume": float(backing_volume),
     }
     return out_path, meta
 
+
+# ============================
+# INPUT (top)
+# ============================
+st.subheader("Input")
+
+uploaded = st.file_uploader("MIDI file (.mid / .midi)", type=["mid", "midi"])
+
+st.markdown("<div class='sp'></div>", unsafe_allow_html=True)
+
+moods = list_moods()
+st.selectbox(
+    "Mood",
+    moods,
+    index=moods.index(st.session_state["mood_name"]) if st.session_state["mood_name"] in moods else 0,
+    key="mood_name",
+)
+
+st.toggle(
+    "Auto choose settings",
+    value=bool(st.session_state["auto_settings"]),
+    key="auto_settings",
+    help="Picks good defaults for this MIDI. You can override anything in Advanced controls.",
+)
+
+if uploaded is not None and st.session_state["auto_settings"]:
+    midi_bytes = uploaded.getvalue()
+    file_sig = hashlib.sha1(midi_bytes).hexdigest()
+    reco = recommend_settings(midi_bytes)
+
+    st.caption(
+        f"Auto: chords={reco['harmony_mode']} · drums={reco['drums_mode']} · quantize={'on' if reco['quantize_melody'] else 'off'}"
+    )
+    reapply = st.button("Re-apply auto", use_container_width=True)
+    _apply_auto_settings(reco, file_sig=file_sig, force=bool(reapply))
+
+st.toggle(
+    "Auto song sections (intro/verse/chorus/outro)",
+    value=bool(st.session_state["auto_sections"]),
+    key="auto_sections",
+)
+structure_mode = "auto" if bool(st.session_state["auto_sections"]) else "none"
+
+st.markdown("**Backing tracks**")
+st.toggle("Bass (rules)", value=bool(st.session_state["make_bass"]), key="make_bass")
+st.toggle("Pad", value=bool(st.session_state["make_pad"]), key="make_pad")
+st.toggle("Drums", value=bool(st.session_state["make_drums"]), key="make_drums")
+
+st.markdown("**Mix**")
+st.slider(
+    "Melody volume",
+    0.0,
+    2.0,
+    float(st.session_state["melody_volume"]),
+    0.05,
+    key="melody_volume",
+    help="Scales the velocity (loudness) of the original melody track(s) in the output MIDI.",
+)
+st.slider(
+    "Backing volume",
+    0.0,
+    2.0,
+    float(st.session_state["backing_volume"]),
+    0.05,
+    key="backing_volume",
+    help="Scales the velocity (loudness) of generated backing tracks (bass/pad/drums).",
+)
 
 # --- Melody track picker (multi-select) ---
 melody_track_indices: Optional[list[int]] = None
@@ -730,13 +720,12 @@ if uploaded is not None:
         f.write(uploaded.getvalue())
         tmp_path = Path(f.name)
 
-    pm_preview, info_preview, grid_preview, melody_inst_preview, sel_preview = load_and_prepare(tmp_path, melody_instrument_index=None)
+    pm_preview, info_preview, grid_preview, melody_inst_preview, sel_preview = load_and_prepare(
+        tmp_path, melody_instrument_index=None
+    )
     _, intro_preview = _auto_pick_with_intro(pm_preview, info_preview, melody_inst_preview, sel_preview)
 
-    with left:
-        st.markdown('<div class="card" style="margin-top: 14px;">', unsafe_allow_html=True)
-        st.subheader("3) Melody track(s)")
-
+    with st.expander("Melody track selection", expanded=False):
         use_auto = st.toggle("Auto-pick melody track", value=True)
 
         options: list[str] = []
@@ -764,111 +753,416 @@ if uploaded is not None:
                 options=options,
                 default=[default_label] if default_label else [],
             )
-            melody_track_indices = [int(x.split(':')[0].strip()) for x in picked] if picked else None
+            melody_track_indices = [int(x.split(":")[0].strip()) for x in picked] if picked else None
 
         with st.expander("Show instrument list"):
             st.json(
                 [
-                    {"idx": i, "name": (inst.name or f"Instrument {i}"), "is_drum": inst.is_drum, "notes": len(inst.notes)}
+                    {
+                        "idx": i,
+                        "name": (inst.name or f"Instrument {i}"),
+                        "is_drum": inst.is_drum,
+                        "notes": len(inst.notes),
+                    }
                     for i, inst in enumerate(pm_preview.instruments)
                 ]
             )
 
-        melody_volume = st.slider("Melody volume", 0.0, 2.0, 1.0, 0.05)
-        backing_volume = st.slider("Backing volume", 0.0, 2.0, 1.0, 0.05)
+with st.expander("Advanced controls", expanded=False):
+    st.markdown("**Harmony (chords)**")
+    harmony_mode = st.selectbox(
+        "Chord generator",
+        ["baseline (rules)", "ml (transformer)"],
+        index=["baseline (rules)", "ml (transformer)"].index(st.session_state["harmony_mode"])
+        if st.session_state["harmony_mode"] in ["baseline (rules)", "ml (transformer)"]
+        else 0,
+        key="harmony_mode",
+    )
 
-        st.markdown("</div>", unsafe_allow_html=True)
+    if str(harmony_mode).startswith("ml"):
+        st.text_input("Chord model path", value=str(st.session_state["chord_model_path"]), key="chord_model_path")
+        st.selectbox(
+            "Chord step size (beats)",
+            [1.0, 2.0, 4.0],
+            index=[1.0, 2.0, 4.0].index(float(st.session_state["chord_step_beats"]))
+            if float(st.session_state["chord_step_beats"]) in [1.0, 2.0, 4.0]
+            else 1,
+            key="chord_step_beats",
+        )
 
+        st.toggle(
+            "Include key features (recommended)",
+            value=bool(st.session_state["chord_include_key"]),
+            key="chord_include_key",
+        )
+        st.toggle(
+            "Stochastic chords (more variety)",
+            value=bool(st.session_state["chord_stochastic"]),
+            key="chord_stochastic",
+        )
+        st.slider(
+            "Chord temperature",
+            0.7,
+            1.6,
+            float(st.session_state["chord_temp"]),
+            0.01,
+            key="chord_temp",
+            help="Controls randomness when sampling chords. Lower = safer/more predictable. Higher = more variety (and more risk).",
+        )
+        st.slider(
+            "Chord top-k (0 = no top-k)",
+            0,
+            40,
+            int(st.session_state["chord_top_k"]),
+            1,
+            key="chord_top_k",
+            help="Limits sampling to the top-k most likely chord options at each step. 0 disables top-k filtering (most random).",
+        )
+        st.slider(
+            "Chord repeat penalty",
+            0.0,
+            3.0,
+            float(st.session_state["chord_repeat_penalty"]),
+            0.05,
+            key="chord_repeat_penalty",
+            help="Discourages repeating the same chord too often. Higher = fewer repeats (can also force weird changes if too high).",
+        )
+        st.slider(
+            "Chord smoothness (change penalty)",
+            0.0,
+            0.6,
+            float(st.session_state["chord_change_penalty"]),
+            0.01,
+            key="chord_change_penalty",
+            disabled=bool(st.session_state["chord_stochastic"]),
+            help="Penalizes chord-to-chord changes. Higher = smoother/less change. Disabled when 'Stochastic chords' is on.",
+        )
+        st.slider(
+            "Bars per chord (baseline only)",
+            1,
+            4,
+            int(st.session_state["bars_per_chord"]),
+            1,
+            key="bars_per_chord",
+            disabled=True,
+            help="How long each chord lasts in the rules-based chord generator. (Not used for ML chords.)",
+        )
+    else:
+        st.slider(
+            "Bars per chord",
+            1,
+            4,
+            int(st.session_state["bars_per_chord"]),
+            1,
+            key="bars_per_chord",
+            help="How long each chord lasts in the rules-based chord generator. Higher = slower harmonic rhythm.",
+        )
 
+    st.markdown("**Melody preprocessing**")
+    st.toggle(
+        "Quantize melody to beat grid",
+        value=bool(st.session_state["quantize_melody"]),
+        key="quantize_melody",
+        help="Snaps melody note start/end times to the beat grid. Helps messy MIDI timing, but can reduce human feel.",
+    )
+
+    st.divider()
+    st.markdown("**Drums**")
+    st.selectbox(
+        "Drums generator",
+        ["rules", "ml"],
+        index=["rules", "ml"].index(st.session_state["drums_mode"])
+        if st.session_state["drums_mode"] in ["rules", "ml"]
+        else 1,
+        key="drums_mode",
+    )
+    st.slider(
+        "ML drum temperature",
+        0.8,
+        1.4,
+        float(st.session_state["ml_temp"]),
+        0.01,
+        key="ml_temp",
+        disabled=(st.session_state["drums_mode"] != "ml"),
+        help="Controls randomness for ML drums. Lower = tighter/safer grooves. Higher = more variation (and more chaos).",
+    )
+
+    st.divider()
+    st.markdown("**Instruments (MIDI / General MIDI programs)**")
+    st.caption("This changes the instrument program in the output MIDI. The exact sound depends on your MIDI synth/DAW.")
+
+    pad_idx = _preset_index(PAD_PRESETS, int(st.session_state["pad_program"]))
+    pad_preset = st.selectbox(
+        "Chords instrument (Pad track)",
+        PAD_PRESETS,
+        index=pad_idx,
+        format_func=lambda x: f"{x[0]} ({x[1]})",
+        key="pad_preset",
+    )
+    st.toggle("Custom pad program # (0-127)", value=bool(st.session_state["pad_custom_on"]), key="pad_custom_on")
+    if st.session_state["pad_custom_on"]:
+        st.number_input("Pad program", 0, 127, int(st.session_state["pad_program"]), key="pad_program")
+    else:
+        st.session_state["pad_program"] = int(pad_preset[1])
+
+    bass_idx = _preset_index(BASS_PRESETS, int(st.session_state["bass_program"]))
+    bass_preset = st.selectbox(
+        "Bass instrument (Bass track)",
+        BASS_PRESETS,
+        index=bass_idx,
+        format_func=lambda x: f"{x[0]} ({x[1]})",
+        key="bass_preset",
+    )
+    st.toggle("Custom bass program # (0-127)", value=bool(st.session_state["bass_custom_on"]), key="bass_custom_on")
+    if st.session_state["bass_custom_on"]:
+        st.number_input("Bass program", 0, 127, int(st.session_state["bass_program"]), key="bass_program")
+    else:
+        st.session_state["bass_program"] = int(bass_preset[1])
+
+    st.divider()
+    st.markdown("**Humanize**")
+    st.toggle("Humanize timing/velocity", value=bool(st.session_state["humanize"]), key="humanize")
+    st.slider(
+        "Timing jitter (ms)",
+        0.0,
+        35.0,
+        float(st.session_state["jitter_ms"]),
+        1.0,
+        key="jitter_ms",
+        disabled=not bool(st.session_state["humanize"]),
+        help="Randomly shifts note timing (in milliseconds) to feel less robotic.",
+    )
+    st.slider(
+        "Velocity jitter",
+        0,
+        20,
+        int(st.session_state["vel_jitter"]),
+        1,
+        key="vel_jitter",
+        disabled=not bool(st.session_state["humanize"]),
+        help="Randomly varies note velocity (loudness). Higher = more dynamic (or messier).",
+    )
+    st.slider(
+        "Swing (0..1)",
+        0.0,
+        0.6,
+        float(st.session_state["swing"]),
+        0.01,
+        key="swing",
+        disabled=not bool(st.session_state["humanize"]),
+        help="Delays off-beat notes to create swing. 0 = straight, higher = more swing feel.",
+    )
+
+    st.divider()
+    st.markdown("**Seed**")
+    st.number_input(
+        "Seed value",
+        value=int(st.session_state["seed_value"]),
+        step=1,
+        key="seed_value",
+        help="A fixed seed makes results repeatable. Same input + same settings + same seed ≈ same output.",
+    )
+    st.toggle(
+        "Use seed",
+        value=bool(st.session_state["use_seed"]),
+        key="use_seed",
+        help="Turn on to make generation deterministic (repeatable) using the Seed value above.",
+    )
+
+    st.divider()
+    st.markdown("**🎧 Audio preview (WAV)**")
+    st.text_input(
+        "SoundFont (.sf2) path",
+        value=str(st.session_state.get("soundfont_path", "") or ""),
+        key="soundfont_path",
+        help=(
+            "Used to render an in-app audio preview (WAV) via FluidSynth. "
+            "You need: (1) fluidsynth installed, and (2) a SoundFont .sf2 file (e.g., GeneralUser_GS.sf2)."
+        ),
+    )
+    st.toggle(
+        "Auto-render audio preview after generation",
+        value=bool(st.session_state.get("auto_render_audio", True)),
+        key="auto_render_audio",
+        help="If enabled, ChordCraft will render a WAV preview right after generation (slower).",
+    )
+
+generate_btn = st.button("✨ Generate backing track", use_container_width=True, disabled=(uploaded is None))
+
+# ============================
+# GENERATE (store output)
+# ============================
 if generate_btn and uploaded is not None:
     seed: Optional[int] = int(st.session_state["seed_value"]) if bool(st.session_state["use_seed"]) else None
     structure_mode = "auto" if bool(st.session_state["auto_sections"]) else "none"
 
-    with right:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("Output")
+    try:
+        with st.spinner("Generating backing track..."):
+            out_path, meta = run_pipeline(
+                midi_bytes=uploaded.getvalue(),
+                mood_name=st.session_state["mood_name"],
+                harmony_mode=st.session_state["harmony_mode"],
+                chord_model_path=st.session_state["chord_model_path"],
+                chord_step_beats=float(st.session_state["chord_step_beats"]),
+                chord_include_key=bool(st.session_state["chord_include_key"]),
+                chord_stochastic=bool(st.session_state["chord_stochastic"]),
+                chord_temp=float(st.session_state["chord_temp"]),
+                chord_top_k=int(st.session_state["chord_top_k"]),
+                chord_repeat_penalty=float(st.session_state["chord_repeat_penalty"]),
+                chord_change_penalty=float(st.session_state["chord_change_penalty"]),
+                bars_per_chord=int(st.session_state["bars_per_chord"]),
+                quantize_melody=bool(st.session_state["quantize_melody"]),
+                make_bass=bool(st.session_state["make_bass"]),
+                make_pad=bool(st.session_state["make_pad"]),
+                make_drums=bool(st.session_state["make_drums"]),
+                melody_track_indices=melody_track_indices,
+                seed=seed,
+                structure_mode=structure_mode,
+                drums_mode=st.session_state["drums_mode"],
+                ml_temp=float(st.session_state["ml_temp"]),
+                humanize=bool(st.session_state["humanize"]),
+                jitter_ms=float(st.session_state["jitter_ms"]),
+                vel_jitter=int(st.session_state["vel_jitter"]),
+                swing=float(st.session_state["swing"]),
+                pad_program=int(st.session_state["pad_program"]),
+                bass_program=int(st.session_state["bass_program"]),
+                melody_volume=float(st.session_state["melody_volume"]),
+                backing_volume=float(st.session_state["backing_volume"]),
+            )
 
-        try:
-            with st.spinner("Generating backing track..."):
-                out_path, meta = run_pipeline(
-                    midi_bytes=uploaded.getvalue(),
-                    mood_name=st.session_state["mood_name"],
-                    harmony_mode=st.session_state["harmony_mode"],
-                    chord_model_path=st.session_state["chord_model_path"],
-                    chord_step_beats=float(st.session_state["chord_step_beats"]),
-                    chord_include_key=bool(st.session_state["chord_include_key"]),
-                    chord_stochastic=bool(st.session_state["chord_stochastic"]),
-                    chord_temp=float(st.session_state["chord_temp"]),
-                    chord_top_k=int(st.session_state["chord_top_k"]),
-                    chord_repeat_penalty=float(st.session_state["chord_repeat_penalty"]),
-                    chord_change_penalty=float(st.session_state["chord_change_penalty"]),
-                    bars_per_chord=int(st.session_state["bars_per_chord"]),
-                    quantize_melody=bool(st.session_state["quantize_melody"]),
-                    make_bass=bool(st.session_state["make_bass"]),
-                    make_pad=bool(st.session_state["make_pad"]),
-                    make_drums=bool(st.session_state["make_drums"]),
-                    melody_track_indices=melody_track_indices,
-                    seed=seed,
-                    structure_mode=structure_mode,
-                    drums_mode=st.session_state["drums_mode"],
-                    ml_temp=float(st.session_state["ml_temp"]),
-                    humanize=bool(st.session_state["humanize"]),
-                    jitter_ms=float(st.session_state["jitter_ms"]),
-                    vel_jitter=int(st.session_state["vel_jitter"]),
-                    swing=float(st.session_state["swing"]),
-                    pad_program=int(st.session_state["pad_program"]),
-                    bass_program=int(st.session_state["bass_program"]),
-                )
-        except Exception as e:
-            st.error(f"Generation failed: {e}")
-            st.markdown("</div>", unsafe_allow_html=True)
-            raise
+        st.session_state["_generated_midi_bytes"] = out_path.read_bytes()
+        st.session_state["_generated_meta"] = meta
 
-        info = meta["info"]
-        sel = meta["selection"]
+        # reset audio state for new output
+        gen_sig = hashlib.sha1(st.session_state["_generated_midi_bytes"]).hexdigest()
+        st.session_state["_generated_audio_sig"] = gen_sig
+        st.session_state["_generated_audio_wav"] = None
+        st.session_state["_generated_audio_err"] = None
 
-        st.success("Done ✅")
+        # Optional: auto-render WAV preview
+        if bool(st.session_state.get("auto_render_audio", True)):
+            sf2_path = str(st.session_state.get("soundfont_path", "") or "").strip()
+            cmd = _fluidsynth_cmd()
+            if cmd and sf2_path and Path(sf2_path).exists():
+                try:
+                    with st.spinner("🎧 Rendering audio preview..."):
+                        sf2_mtime = os.path.getmtime(sf2_path)
+                        wav_bytes = render_midi_to_wav_cached(
+                            st.session_state["_generated_midi_bytes"],
+                            sf2_path,
+                            sf2_mtime,
+                            sample_rate=44100,
+                        )
+                    st.session_state["_generated_audio_wav"] = wav_bytes
+                except Exception as _e:
+                    st.session_state["_generated_audio_err"] = str(_e)
 
-        colA, colB, colC = st.columns(3)
-        colA.metric("Tempo (BPM)", f"{info.tempo_bpm:.1f}")
-        colB.metric("Time Signature", f"{info.time_signature.numerator}/{info.time_signature.denominator}")
-        colC.metric("Duration (s)", f"{info.duration:.1f}")
+    except Exception as e:
+        st.error(f"Generation failed: {e}")
 
-        st.markdown(f"**Pad program:** `{meta['pad_program']}`  ·  **Bass program:** `{meta['bass_program']}`")
+# ============================
+# OUTPUT (below)
+# ============================
+st.divider()
+st.subheader("Output")
 
-        if meta["selected_melody_indices"]:
-            st.markdown(f"**Melody tracks (manual):** {meta['selected_melody_indices']}")
+gen_bytes = st.session_state.get("_generated_midi_bytes")
+meta = st.session_state.get("_generated_meta")
+
+if not gen_bytes or not meta:
+    st.markdown('<p class="muted">Generate a backing track to see results here.</p>', unsafe_allow_html=True)
+else:
+    info = meta["info"]
+    sel = meta["selection"]
+
+    colA, colB, colC = st.columns(3)
+    colA.metric("Tempo (BPM)", f"{info.tempo_bpm:.1f}")
+    colB.metric("Time Signature", f"{info.time_signature.numerator}/{info.time_signature.denominator}")
+    colC.metric("Duration (s)", f"{info.duration:.1f}")
+
+    st.markdown(f"**Pad program:** `{meta['pad_program']}`  ·  **Bass program:** `{meta['bass_program']}`")
+
+    if meta["selected_melody_indices"]:
+        st.markdown(f"**Melody tracks (manual):** {meta['selected_melody_indices']}")
+    else:
+        if meta["auto_intro_indices"]:
+            st.markdown(
+                f"**Melody tracks (auto):** main idx={sel.instrument_index} · `{sel.instrument_name}` "
+                f"(+ intro: {meta['auto_intro_indices']})"
+            )
         else:
-            if meta["auto_intro_indices"]:
-                st.markdown(
-                    f"**Melody tracks (auto):** main idx={sel.instrument_index} · `{sel.instrument_name}` "
-                    f"(+ intro: {meta['auto_intro_indices']})"
-                )
-            else:
-                st.markdown(f"**Melody track (auto):** idx={sel.instrument_index} · `{sel.instrument_name}`")
+            st.markdown(f"**Melody track (auto):** idx={sel.instrument_index} · `{sel.instrument_name}`")
 
-        st.markdown(f"**Used melody indices:** {meta['used_melody_indices']}")
-        st.markdown(f"**Melody notes extracted (for analysis):** `{meta['melody_note_count']}`")
+    st.markdown(f"**Used melody indices:** {meta['used_melody_indices']}")
+    st.markdown(f"**Melody notes extracted (for analysis):** `{meta['melody_note_count']}`")
 
-        st.markdown(f"**Detected key:** {key_to_string(meta['raw_key'])}")
-        if meta["key"] != meta["raw_key"]:
-            st.markdown(f"**After mood '{meta['mood'].name}' bias:** {key_to_string(meta['key'])}")
+    st.markdown(f"**Detected key:** {key_to_string(meta['raw_key'])}")
+    if meta["key"] != meta["raw_key"]:
+        st.markdown(f"**After mood '{meta['mood'].name}' bias:** {key_to_string(meta['key'])}")
 
-        st.markdown("**Backing note counts:**")
-        st.json(meta["arrangement_counts"])
+    st.markdown("**Backing note counts:**")
+    st.json(meta["arrangement_counts"])
 
-        chords = meta["chords"]
-        preview = " · ".join(chord_label(c.root_pc, c.quality, c.extensions) for c in chords[:8])
-        st.markdown("**Chord progression preview:**")
-        st.code(preview if preview else "(none)")
+    chords = meta["chords"]
+    preview = " · ".join(chord_label(c.root_pc, c.quality, c.extensions) for c in chords[:8])
+    st.markdown("**Chord progression preview:**")
+    st.code(preview if preview else "(none)")
 
-        midi_out_bytes = out_path.read_bytes()
-        st.download_button(
-            label="⬇️ Download generated MIDI",
-            data=midi_out_bytes,
-            file_name="backing_track.mid",
-            mime="audio/midi",
-            use_container_width=True,
-        )
+    # ---- Audio preview (Option B) ----
+    st.markdown("**🎧 Preview (audio)**")
 
-        st.markdown("</div>", unsafe_allow_html=True)
+    current_sig = hashlib.sha1(gen_bytes).hexdigest()
+    if st.session_state.get("_generated_audio_sig") != current_sig:
+        st.session_state["_generated_audio_sig"] = current_sig
+        st.session_state["_generated_audio_wav"] = None
+        st.session_state["_generated_audio_err"] = None
+
+    sf2_path = str(st.session_state.get("soundfont_path", "") or "").strip()
+    cmd = _fluidsynth_cmd()
+
+    if not cmd:
+        st.info("Install FluidSynth (so `fluidsynth` is on your PATH) to enable in-app audio preview.")
+    elif not sf2_path:
+        st.info("Set a SoundFont (.sf2) path in Advanced controls → 🎧 Audio preview to enable audio playback.")
+    elif not Path(sf2_path).exists():
+        st.info(f"SoundFont file not found: `{sf2_path}`. Update the path in Advanced controls.")
+    else:
+        err = st.session_state.get("_generated_audio_err")
+        wav_bytes = st.session_state.get("_generated_audio_wav")
+
+        render_clicked = False
+        if not wav_bytes:
+            if err:
+                st.warning(f"Audio preview failed: {err}")
+            render_clicked = st.button("🎧 Render audio preview", use_container_width=True)
+
+        if render_clicked and not wav_bytes:
+            try:
+                with st.spinner("Rendering audio preview..."):
+                    sf2_mtime = os.path.getmtime(sf2_path)
+                    wav_bytes = render_midi_to_wav_cached(gen_bytes, sf2_path, sf2_mtime, sample_rate=44100)
+                st.session_state["_generated_audio_wav"] = wav_bytes
+                st.session_state["_generated_audio_err"] = None
+            except Exception as e:
+                st.session_state["_generated_audio_err"] = str(e)
+                st.warning(f"Audio preview failed: {e}")
+
+        # Show player if we have audio now
+        wav_bytes = st.session_state.get("_generated_audio_wav")
+        if wav_bytes:
+            st.audio(wav_bytes, format="audio/wav")
+            st.download_button(
+                label="⬇️ Download WAV preview",
+                data=wav_bytes,
+                file_name="chordcraft_preview.wav",
+                mime="audio/wav",
+                use_container_width=True,
+            )
+
+    st.download_button(
+        label="⬇️ Download generated MIDI",
+        data=gen_bytes,
+        file_name="backing_track.mid",
+        mime="audio/midi",
+        use_container_width=True,
+    )
