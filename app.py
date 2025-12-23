@@ -667,7 +667,7 @@ st.markdown(
     <div id="cc-hero-wrap">
       <div class="hero">
         <h1>ChordCraft</h1>
-        <p>Upload a MIDI melody → generate bass/chords/drums → download a new multi-track MIDI (+ optional WAV preview).</p>
+        <p>Upload a MIDI melody → generate bass/chords/drums → download a new multi-track MIDI </p>
       </div>
     </div>
     """,
@@ -1316,6 +1316,22 @@ elif nav == "Advanced":
         st.caption("SoundFont not found in repo (expected: soundfonts/GeneralUser-GS.sf2). WAV preview will be disabled.")
     if not _fluidsynth_cmd():
         st.caption("FluidSynth not found on PATH. WAV preview will be disabled.")
+
+    st.divider()
+    st.markdown("### Generate")
+    _render_settings_pills()
+
+    uploaded_bytes = st.session_state.get("_uploaded_midi_bytes")
+    if uploaded_bytes is None:
+        st.caption("Upload a MIDI in **Controls** first to enable generation.")
+
+    generate_btn = st.button(
+        "✨ Generate backing track",
+        use_container_width=True,
+        disabled=(uploaded_bytes is None),
+        help="Runs the pipeline and updates the output panel at the bottom.",
+    )
+
 
 else:
     st.markdown("### Help & details")
