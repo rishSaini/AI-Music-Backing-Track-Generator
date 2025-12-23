@@ -1,6 +1,7 @@
 # app.py
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import shutil
@@ -11,6 +12,7 @@ from typing import Any, Dict, Optional
 
 import pretty_midi
 import streamlit as st
+import streamlit.components.v1 as components
 
 from backingtrack.arrange import arrange_backing
 from backingtrack.harmony_baseline import generate_chords
@@ -37,73 +39,147 @@ def chord_label(root_pc: int, quality: str, extensions: tuple[int, ...]) -> str:
 
 
 # ----------------------------
-# Audio preview (Option B): MIDI -> WAV with FluidSynth
+# Repo path helpers
 # ----------------------------
-def _guess_soundfont_path() -> str:
+def _find_repo_file(rel_path: str, *, max_parents: int = 6) -> str:
     """
-    Best-effort default SoundFont path for FluidSynth rendering.
-    Override via:
-      - UI (Advanced controls -> 🎧 Audio preview)
-      - env var: CHORDCRAFT_SOUNDFONT
+    Try to locate a repo-relative file robustly in local/dev + deployed envs.
+    Searches:
+      - CWD
+      - directory containing this file
+      - up to `max_parents` parent directories of this file
+    Returns empty string if not found.
     """
-    env = os.environ.get("CHORDCRAFT_SOUNDFONT", "").strip()
-    if env:
-        return env
+    rel = Path(rel_path)
 
-    candidates = [
-        "soundfonts/GeneralUser_GS.sf2",
-        "data/soundfonts/GeneralUser_GS.sf2",
-        "assets/GeneralUser_GS.sf2",
-        "GeneralUser_GS.sf2",
-    ]
-    for c in candidates:
-        if Path(c).exists():
-            return str(Path(c))
+    candidates: list[Path] = []
+    try:
+        here = Path(__file__).resolve().parent
+        candidates.append(Path.cwd())
+        candidates.append(here)
+        parents = list(here.parents)[: max(0, int(max_parents))]
+        candidates.extend(parents)
+    except Exception:
+        candidates.append(Path.cwd())
+
+    for base in candidates:
+        p = base / rel
+        if p.exists():
+            try:
+                return str(p.resolve())
+            except Exception:
+                return str(p)
     return ""
 
 
+# ----------------------------
+# Fixed defaults (no UI paths)
+# ----------------------------
+DEFAULT_CHORD_MODEL_PATH = _find_repo_file("data/ml/chord_model_new.pt") or "data/ml/chord_model_new.pt"
+
+# Your repo file is "soundfonts\\GeneralUser-GS.sf2" (hyphen).
+# We also include underscore fallback in case your filename differs.
+def _guess_soundfont_path() -> str:
+    """
+    Best-effort default SoundFont path for FluidSynth rendering.
+    Override via env var:
+      - CHORDCRAFT_SOUNDFONT
+    """
+    env = os.environ.get("CHORDCRAFT_SOUNDFONT", "").strip()
+    if env and Path(env).exists():
+        return str(Path(env).resolve())
+
+    candidates = [
+        "soundfonts/GeneralUser-GS.sf2",
+        "soundfonts/GeneralUser_GS.sf2",
+        "data/soundfonts/GeneralUser-GS.sf2",
+        "data/soundfonts/GeneralUser_GS.sf2",
+        "assets/GeneralUser-GS.sf2",
+        "assets/GeneralUser_GS.sf2",
+        "GeneralUser-GS.sf2",
+        "GeneralUser_GS.sf2",
+    ]
+    for c in candidates:
+        found = _find_repo_file(c)
+        if found:
+            return found
+        if Path(c).exists():
+            return str(Path(c).resolve())
+    return ""
+
+
+DEFAULT_SOUNDFONT_PATH = _guess_soundfont_path()
+
+
+# ----------------------------
+# Audio preview: MIDI -> WAV with FluidSynth
+# ----------------------------
 def _fluidsynth_cmd() -> Optional[str]:
     # On Windows this may be fluidsynth.exe; shutil.which handles that.
     return shutil.which("fluidsynth")
 
 
-def _render_midi_to_wav_bytes(midi_bytes: bytes, *, soundfont_path: str, sample_rate: int = 44100) -> bytes:
+def render_midi_to_wav_bytes(
+    midi_path: Path,
+    sf2_path: Path,
+    *,
+    sample_rate: int = 44100,
+    gain: float = 0.8,
+) -> bytes:
     """
-    Render MIDI -> WAV using system `fluidsynth` + a .sf2 SoundFont.
-    Returns WAV bytes.
+    Offline render (NO speaker playback) using FluidSynth fast renderer.
     """
+    if not sf2_path.exists():
+        raise FileNotFoundError(f"SoundFont not found: {sf2_path}")
+
     cmd = _fluidsynth_cmd()
     if not cmd:
-        raise RuntimeError("FluidSynth not found on PATH. Install fluidsynth to enable audio preview.")
+        raise RuntimeError("FluidSynth not found on PATH. Install fluidsynth to enable WAV preview.")
 
+    tmp_wav = Path(tempfile.mkstemp(suffix=".wav")[1])
+
+    # IMPORTANT: options FIRST, then soundfont, then midifile
+    args = [
+        cmd,
+        "-ni",
+        "-T",
+        "wav",
+        "-F",
+        str(tmp_wav),
+        "-r",
+        str(sample_rate),
+        "-g",
+        str(gain),
+        str(sf2_path),
+        str(midi_path),
+    ]
+
+    try:
+        subprocess.run(args, check=True, capture_output=True, text=True)
+        return tmp_wav.read_bytes()
+    finally:
+        try:
+            tmp_wav.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _render_midi_to_wav_bytes(
+    midi_bytes: bytes,
+    *,
+    soundfont_path: str,
+    sample_rate: int = 44100,
+    gain: float = 0.8,
+) -> bytes:
     sf2 = Path(soundfont_path)
     if not sf2.exists():
-        raise RuntimeError(f"SoundFont not found: {soundfont_path}")
+        raise FileNotFoundError(f"SoundFont not found: {soundfont_path}")
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        mid_path = td / "preview.mid"
-        wav_path = td / "preview.wav"
-        mid_path.write_bytes(midi_bytes)
-
-        # -ni : no interactive shell
-        # -F  : output wav file
-        # -r  : sample rate
-        # -g  : gain (kept modest to avoid clipping)
-        try:
-            subprocess.run(
-                [cmd, "-ni", str(sf2), str(mid_path), "-F", str(wav_path), "-r", str(sample_rate), "-g", "0.8"],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-        except subprocess.CalledProcessError as e:
-            err = (e.stderr or b"").decode("utf-8", errors="ignore").strip()
-            raise RuntimeError(f"FluidSynth failed to render audio. {err}") from e
-
-        if not wav_path.exists():
-            raise RuntimeError("FluidSynth did not produce a WAV file.")
-        return wav_path.read_bytes()
+        midi_path = td / "preview.mid"
+        midi_path.write_bytes(midi_bytes)
+        return render_midi_to_wav_bytes(midi_path, sf2, sample_rate=sample_rate, gain=gain)
 
 
 @st.cache_data(show_spinner=False)
@@ -121,7 +197,18 @@ def render_midi_to_wav_cached(
     return _render_midi_to_wav_bytes(midi_bytes, soundfont_path=soundfont_path, sample_rate=sample_rate)
 
 
-DEFAULT_SOUNDFONT_PATH = _guess_soundfont_path()
+def wav_player(wav_bytes: bytes) -> None:
+    """
+    Renders a real browser audio player (play/pause/seek) with NO autoplay.
+    """
+    b64 = base64.b64encode(wav_bytes).decode("utf-8")
+    html = f"""
+    <audio controls preload="none" style="width:100%; height:40px;">
+      <source src="data:audio/wav;base64,{b64}" type="audio/wav" />
+      Your browser does not support the audio element.
+    </audio>
+    """
+    components.html(html, height=70)
 
 
 # ----------------------------
@@ -179,7 +266,7 @@ def _auto_pick_with_intro(
     Backwards compatible:
       - _auto_pick_with_intro(pm, sel)
       - _auto_pick_with_intro(pm, info, melody_inst, sel)
-      - _auto_pick_with_intro(pm, info, sel)   (rare, but supported)
+      - _auto_pick_with_intro(pm, info, sel)
 
     Also supports multi-lead selection via sel.instrument_indices.
     Returns:
@@ -187,19 +274,14 @@ def _auto_pick_with_intro(
     """
     info = None
 
-    # Case A: called as (pm, sel)
     if sel is None and melody_inst is None and hasattr(info_or_sel, "instrument_index"):
         sel = info_or_sel
-
-    # Case B: called as (pm, info, sel) where 3rd arg is actually sel
     elif sel is None and melody_inst is not None and hasattr(melody_inst, "instrument_index") and not hasattr(
         melody_inst, "notes"
     ):
         info = info_or_sel
         sel = melody_inst
         melody_inst = None
-
-    # Case C: called as (pm, info, melody_inst, sel)
     else:
         info = info_or_sel
 
@@ -351,7 +433,7 @@ def recommend_settings(midi_bytes: bytes) -> Dict[str, Any]:
     return {
         "harmony_mode": harmony_mode,
         "bars_per_chord": int(bars_per_chord),
-        "chord_model_path": "data/ml/chord_model_new.pt",
+        "chord_model_path": DEFAULT_CHORD_MODEL_PATH,
         "chord_step_beats": float(chord_step_beats),
         "chord_include_key": bool(chord_include_key),
         "chord_stochastic": bool(chord_stochastic),
@@ -401,7 +483,7 @@ st.markdown(
     """
     <div class="hero">
       <div class="hero-title">ChordCraft</div>
-      <div class="hero-sub">Upload a MIDI melody → generate bass/pad/drums → download a new multi-track MIDI.</div>
+      <div class="hero-sub">Upload a MIDI melody → generate bass/chords/drums → download a new multi-track MIDI.</div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -412,7 +494,7 @@ DEFAULTS: Dict[str, Any] = {
     "auto_settings": True,
     "harmony_mode": "baseline (rules)",
     "bars_per_chord": 1,
-    "chord_model_path": "data/ml/chord_model_new.pt",
+    "chord_model_path": DEFAULT_CHORD_MODEL_PATH,  # hidden from UI
     "chord_step_beats": 2.0,
     "chord_include_key": True,
     "chord_stochastic": False,
@@ -439,7 +521,6 @@ DEFAULTS: Dict[str, Any] = {
     "bass_program": 33,
     "pad_custom_on": False,
     "bass_custom_on": False,
-    "soundfont_path": DEFAULT_SOUNDFONT_PATH,
     "auto_render_audio": True,
     "_generated_midi_bytes": None,
     "_generated_meta": None,
@@ -544,11 +625,15 @@ def run_pipeline(
     key = apply_mood_to_key(raw_key, mood)
 
     if str(harmony_mode).startswith("ml"):
+        model_path = str(chord_model_path or DEFAULT_CHORD_MODEL_PATH)
+        if not Path(model_path).exists():
+            raise FileNotFoundError(f"Chord model not found: {model_path}")
+
         chords = generate_chords_ml_steps(
             melody_notes=melody_notes,
             grid=grid,
             duration_seconds=float(info.duration),
-            model_path=str(chord_model_path),
+            model_path=model_path,
             cfg=ChordSampleConfig(
                 step_beats=float(chord_step_beats),
                 include_key=bool(chord_include_key),
@@ -688,8 +773,8 @@ st.toggle(
 structure_mode = "auto" if bool(st.session_state["auto_sections"]) else "none"
 
 st.markdown("**Backing tracks**")
-st.toggle("Bass (rules)", value=bool(st.session_state["make_bass"]), key="make_bass")
-st.toggle("Pad", value=bool(st.session_state["make_pad"]), key="make_pad")
+st.toggle("Bass", value=bool(st.session_state["make_bass"]), key="make_bass")
+st.toggle("Chords", value=bool(st.session_state["make_pad"]), key="make_pad")
 st.toggle("Drums", value=bool(st.session_state["make_drums"]), key="make_drums")
 
 st.markdown("**Mix**")
@@ -709,7 +794,7 @@ st.slider(
     float(st.session_state["backing_volume"]),
     0.05,
     key="backing_volume",
-    help="Scales the velocity (loudness) of generated backing tracks (bass/pad/drums).",
+    help="Scales the velocity (loudness) of generated backing tracks (bass/chords/drums).",
 )
 
 # --- Melody track picker (multi-select) ---
@@ -780,7 +865,7 @@ with st.expander("Advanced controls", expanded=False):
     )
 
     if str(harmony_mode).startswith("ml"):
-        st.text_input("Chord model path", value=str(st.session_state["chord_model_path"]), key="chord_model_path")
+        # Chord model path is now hidden (fixed default)
         st.selectbox(
             "Chord step size (beats)",
             [1.0, 2.0, 4.0],
@@ -971,21 +1056,17 @@ with st.expander("Advanced controls", expanded=False):
 
     st.divider()
     st.markdown("**🎧 Audio preview (WAV)**")
-    st.text_input(
-        "SoundFont (.sf2) path",
-        value=str(st.session_state.get("soundfont_path", "") or ""),
-        key="soundfont_path",
-        help=(
-            "Used to render an in-app audio preview (WAV) via FluidSynth. "
-            "You need: (1) fluidsynth installed, and (2) a SoundFont .sf2 file (e.g., GeneralUser_GS.sf2)."
-        ),
-    )
     st.toggle(
         "Auto-render audio preview after generation",
         value=bool(st.session_state.get("auto_render_audio", True)),
         key="auto_render_audio",
         help="If enabled, ChordCraft will render a WAV preview right after generation (slower).",
     )
+    if not DEFAULT_SOUNDFONT_PATH:
+        st.caption("SoundFont not found in repo (expected: soundfonts/GeneralUser-GS.sf2). WAV preview will be disabled.")
+    if not _fluidsynth_cmd():
+        st.caption("FluidSynth not found on PATH. WAV preview will be disabled.")
+
 
 generate_btn = st.button("✨ Generate backing track", use_container_width=True, disabled=(uploaded is None))
 
@@ -1002,7 +1083,7 @@ if generate_btn and uploaded is not None:
                 midi_bytes=uploaded.getvalue(),
                 mood_name=st.session_state["mood_name"],
                 harmony_mode=st.session_state["harmony_mode"],
-                chord_model_path=st.session_state["chord_model_path"],
+                chord_model_path=DEFAULT_CHORD_MODEL_PATH,
                 chord_step_beats=float(st.session_state["chord_step_beats"]),
                 chord_include_key=bool(st.session_state["chord_include_key"]),
                 chord_stochastic=bool(st.session_state["chord_stochastic"]),
@@ -1041,7 +1122,7 @@ if generate_btn and uploaded is not None:
 
         # Optional: auto-render WAV preview
         if bool(st.session_state.get("auto_render_audio", True)):
-            sf2_path = str(st.session_state.get("soundfont_path", "") or "").strip()
+            sf2_path = DEFAULT_SOUNDFONT_PATH
             cmd = _fluidsynth_cmd()
             if cmd and sf2_path and Path(sf2_path).exists():
                 try:
@@ -1108,7 +1189,7 @@ else:
     st.markdown("**Chord progression preview:**")
     st.code(preview if preview else "(none)")
 
-    # ---- Audio preview (Option B) ----
+    # ---- Audio preview ----
     st.markdown("**🎧 Preview (audio)**")
 
     current_sig = hashlib.sha1(gen_bytes).hexdigest()
@@ -1117,15 +1198,15 @@ else:
         st.session_state["_generated_audio_wav"] = None
         st.session_state["_generated_audio_err"] = None
 
-    sf2_path = str(st.session_state.get("soundfont_path", "") or "").strip()
+    sf2_path = DEFAULT_SOUNDFONT_PATH
     cmd = _fluidsynth_cmd()
 
     if not cmd:
         st.info("Install FluidSynth (so `fluidsynth` is on your PATH) to enable in-app audio preview.")
     elif not sf2_path:
-        st.info("Set a SoundFont (.sf2) path in Advanced controls → 🎧 Audio preview to enable audio playback.")
+        st.info("SoundFont not found in repo (expected: `soundfonts/GeneralUser-GS.sf2`). WAV preview is disabled.")
     elif not Path(sf2_path).exists():
-        st.info(f"SoundFont file not found: `{sf2_path}`. Update the path in Advanced controls.")
+        st.info(f"SoundFont file not found: `{sf2_path}`. WAV preview is disabled.")
     else:
         err = st.session_state.get("_generated_audio_err")
         wav_bytes = st.session_state.get("_generated_audio_wav")
@@ -1147,22 +1228,34 @@ else:
                 st.session_state["_generated_audio_err"] = str(e)
                 st.warning(f"Audio preview failed: {e}")
 
-        # Show player if we have audio now
         wav_bytes = st.session_state.get("_generated_audio_wav")
         if wav_bytes:
-            st.audio(wav_bytes, format="audio/wav")
+            wav_player(wav_bytes)
+
+            # ---- Downloads side-by-side ----
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                st.download_button(
+                    label="⬇️ Download WAV preview",
+                    data=wav_bytes,
+                    file_name="chordcraft_preview.wav",
+                    mime="audio/wav",
+                    use_container_width=True,
+                )
+            with dl2:
+                st.download_button(
+                    label="⬇️ Download generated MIDI",
+                    data=gen_bytes,
+                    file_name="backing_track.mid",
+                    mime="audio/midi",
+                    use_container_width=True,
+                )
+        else:
+            # If no WAV yet, still show MIDI download full-width
             st.download_button(
-                label="⬇️ Download WAV preview",
-                data=wav_bytes,
-                file_name="chordcraft_preview.wav",
-                mime="audio/wav",
+                label="⬇️ Download generated MIDI",
+                data=gen_bytes,
+                file_name="backing_track.mid",
+                mime="audio/midi",
                 use_container_width=True,
             )
-
-    st.download_button(
-        label="⬇️ Download generated MIDI",
-        data=gen_bytes,
-        file_name="backing_track.mid",
-        mime="audio/midi",
-        use_container_width=True,
-    )
