@@ -5,7 +5,7 @@ import argparse
 import inspect
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pretty_midi

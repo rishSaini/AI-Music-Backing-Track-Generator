@@ -144,7 +144,7 @@ def _viterbi_smooth(logits: np.ndarray, change_penalty: float) -> List[int]:
     for t in range(1, T):
         for c in range(C):
             # min over previous states with change penalty
-            costs = dp[t - 1] + (0.0 if False else 0.0)  # placeholder
+            costs = dp[t - 1].copy() # placeholder
             # vectorize: add penalty where prev != c
             penalty = np.full((C,), float(change_penalty), dtype=np.float64)
             penalty[c] = 0.0
