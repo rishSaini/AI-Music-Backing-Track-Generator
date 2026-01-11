@@ -26,7 +26,6 @@ from backingtrack.render import RenderConfig, write_midi
 
 PC_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
-
 def chord_label(root_pc: int, quality: str, extensions: tuple[int, ...]) -> str:
     name = f"{PC_NAMES[root_pc % 12]}{'' if quality == 'maj' else quality}"
     if 10 in extensions:
@@ -137,7 +136,9 @@ def render_midi_to_wav_bytes(
     if not cmd:
         raise RuntimeError("FluidSynth not found on PATH. Install fluidsynth to enable WAV preview.")
 
-    tmp_wav = Path(tempfile.mkstemp(suffix=".wav")[1])
+    fd, p = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    tmp_wav = Path(p)
 
     # IMPORTANT: options FIRST, then soundfont, then midifile
     args = [
@@ -793,7 +794,9 @@ def run_pipeline(
             HumanizeConfig(timing_jitter_ms=jitter_ms, velocity_jitter=vel_jitter, swing=swing, seed=seed),
         )
 
-    out_path = Path(tempfile.mkstemp(suffix=".mid")[1])
+    fd, p = tempfile.mkstemp(suffix=".mid")
+    os.close(fd)
+    out_path = Path(p)
 
     render_cfg = RenderConfig(
         melody_program=int(melody_source_insts[0].program),
@@ -1670,14 +1673,18 @@ with out:
                 wav_player(wav_bytes)
 
                 dl1, dl2 = st.columns(2)
+
                 with dl1:
                     st.download_button(
                         label="⬇️ Download WAV preview",
-                        data=wav_bytes,
+                        data=wav_bytes or b"",
                         file_name="chordcraft_preview.wav",
                         mime="audio/wav",
                         use_container_width=True,
+                        disabled=not bool(wav_bytes),
+                        key="dl_wav",
                     )
+
                 with dl2:
                     st.download_button(
                         label="⬇️ Download generated MIDI",
@@ -1685,7 +1692,9 @@ with out:
                         file_name="backing_track.mid",
                         mime="audio/midi",
                         use_container_width=True,
+                        key="dl_midi",
                     )
+
             else:
                 st.download_button(
                     label="⬇️ Download generated MIDI",
